@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FlimFlex</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <section id="gate" class="gate">
+    <p class="brand">FlimFlex</p>
+    <div class="panel">
+      <h1>Come in for a recommendation.</h1>
+      <p>Create an account to enter. New members pick genres. Returning members get films from what they have already rated.</p>
+      <div class="tabs">
+        <button type="button" id="tab-register" class="active">Create account</button>
+        <button type="button" id="tab-login">Sign in</button>
+      </div>
+      <form id="auth-form">
+        <label for="username">Username</label>
+        <input id="username" name="username" autocomplete="username" required />
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required />
+        <p id="auth-error" class="error"></p>
+        <button class="primary" id="auth-submit" type="submit">Create account</button>
+      </form>
+    </div>
+  </section>
+
+  <section id="app" class="app hidden">
+    <header class="topbar">
+      <div>
+        <p class="brand">FlimFlex</p>
+        <h1 id="hello">Hello</h1>
+      </div>
+      <button type="button" class="ghost" id="logout">Sign out</button>
+    </header>
+
+    <div id="genre-step" class="panel hidden">
+      <h2>Which genres do you like?</h2>
+      <p>Pick one or more. We’ll start you with the highest-rated films in those genres.</p>
+      <div id="genre-list" class="genres"></div>
+      <p id="genre-error" class="error"></p>
+      <button type="button" class="primary" id="save-genres">Show top-rated films</button>
+    </div>
+
+    <div id="recs" class="hidden">
+      <div class="layout">
+        <div>
+          <h2 id="rec-heading">Recommendations</h2>
+          <div id="movie-grid" class="grid"></div>
+        </div>
+        <aside class="panel">
+          <h2>Your ratings</h2>
+          <ul id="history" class="history"></ul>
+        </aside>
+      </div>
+    </div>
+  </section>
+  <script src="/static/app.js"></script>
+</body>
+</html>
