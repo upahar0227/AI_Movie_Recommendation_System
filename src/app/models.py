@@ -98,6 +98,20 @@ class RecommendationSnapshot(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class SearchEvent(Base):
+    """A submitted search. Keystrokes are not stored."""
+
+    __tablename__ = "search_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    query: Mapped[str] = mapped_column(Text)
+    normalized_query: Mapped[str] = mapped_column(String(200))
+    matched_movie_ids: Mapped[str] = mapped_column(Text, default="[]")
+    clicked_movie_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class Interaction(Base):
     """A single impression, click, rating, or watchlist event."""
 

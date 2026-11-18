@@ -36,6 +36,7 @@ def test_migration_creates_account_tables(tmp_path: Path, monkeypatch: pytest.Mo
         "revoked_tokens",
         "user_genres",
         "recommendation_snapshots",
+        "search_events",
         "alembic_version",
     }
 

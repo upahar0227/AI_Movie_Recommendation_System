@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator
@@ -17,14 +17,16 @@ from src.app.models import (
     Interaction,
     Rating,
     RecommendationSnapshot,
+    SearchEvent,
     User,
     UserGenre,
     WatchlistItem,
 )
 from src.app.security import PERSONALISED_AFTER, recommendation_mode
 from src.app.settings import recommendations_debug_enabled
-from src.recsys.config import GENRE_SELECTION_MAX
+from src.recsys.config import GENRE_SELECTION_MAX, SEARCH_DEDUP_MINUTES, SEARCH_MIN_CHARS
 from src.recsys.personalised import ActivityEvent, RatedMovie, blended_recommendations
+from src.recsys.search_profile import SearchHit, normalize_query
 from src.recsys.serving import RecommenderService
 
 router = APIRouter(tags=["library"])
@@ -115,19 +117,14 @@ def recent_clicks(session: Session, user_id: int, limit: int = 20) -> list[int]:
     return seen
 
 
-def log_search(session: Session, user: User, query: str) -> None:
-    text = query.strip()[:200]
-    if not text:
-        return
-    session.add(
-        Interaction(
-            user_id=user.id,
-            movie_id=0,
-            event_type="search",
-            detail=text,
-            created_at=datetime.now(timezone.utc),
-        )
-    )
+class SearchEventBody(BaseModel):
+    query: str = ""
+    matched_movie_ids: list[int] = Field(default_factory=list)
+    clicked_movie_id: int | None = None
+
+
+def _drop_recommendation_cache(session: Session, user_id: int) -> None:
+    session.execute(delete(RecommendationSnapshot).where(RecommendationSnapshot.user_id == user_id))
 
 
 @router.post("/ratings")
@@ -295,6 +292,104 @@ def log_interaction(
     return {"ok": True}
 
 
+@router.post("/search/events")
+def record_search(
+    body: SearchEventBody,
+    request: Request,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    text = body.query.strip()[:200]
+    normalised = normalize_query(text)
+    if len(normalised) < SEARCH_MIN_CHARS:
+        return {"logged": False}
+    if body.clicked_movie_id is not None:
+        _require_movie(_service(request), body.clicked_movie_id)
+    now = datetime.now(timezone.utc)
+    existing = session.scalar(
+        select(SearchEvent)
+        .where(SearchEvent.user_id == user.id, SearchEvent.normalized_query == normalised)
+        .order_by(SearchEvent.created_at.desc())
+    )
+    within_window = existing is not None and _aware(existing.created_at) >= now - timedelta(minutes=SEARCH_DEDUP_MINUTES)
+    if existing is not None and (within_window or body.clicked_movie_id is not None):
+        if within_window:
+            existing.created_at = now
+            existing.query = text or existing.query
+        if body.matched_movie_ids:
+            existing.matched_movie_ids = json.dumps([int(movie_id) for movie_id in body.matched_movie_ids[:10]])
+        if body.clicked_movie_id is not None:
+            existing.clicked_movie_id = int(body.clicked_movie_id)
+        _drop_recommendation_cache(session, user.id)
+        session.flush()
+        return {"logged": True, "id": existing.id, "deduplicated": True}
+    row = SearchEvent(
+        user_id=user.id,
+        query=text,
+        normalized_query=normalised[:200],
+        matched_movie_ids=json.dumps([int(movie_id) for movie_id in body.matched_movie_ids[:10]]),
+        clicked_movie_id=body.clicked_movie_id,
+        created_at=now,
+    )
+    session.add(row)
+    _drop_recommendation_cache(session, user.id)
+    session.flush()
+    return {"logged": True, "id": row.id, "deduplicated": False}
+
+
+@router.get("/users/me/searches")
+def list_searches(user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    rows = session.scalars(
+        select(SearchEvent).where(SearchEvent.user_id == user.id).order_by(SearchEvent.created_at.desc())
+    ).all()
+    return {
+        "searches": [
+            {
+                "id": row.id,
+                "query": row.query,
+                "normalized_query": row.normalized_query,
+                "matched_movie_ids": _matched_ids(row.matched_movie_ids),
+                "clicked_movie_id": row.clicked_movie_id,
+                "created_at": _aware(row.created_at).isoformat(),
+            }
+            for row in rows
+        ]
+    }
+
+
+@router.delete("/users/me/searches/{search_id}")
+def delete_search(search_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    row = session.scalar(select(SearchEvent).where(SearchEvent.id == search_id, SearchEvent.user_id == user.id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Search not found.")
+    session.delete(row)
+    _drop_recommendation_cache(session, user.id)
+    return {"deleted": search_id}
+
+
+@router.delete("/users/me/searches")
+def clear_searches(user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    session.execute(delete(SearchEvent).where(SearchEvent.user_id == user.id))
+    _drop_recommendation_cache(session, user.id)
+    return {"cleared": True}
+
+
+def _matched_ids(raw: str) -> list[int]:
+    try:
+        parsed = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [int(movie_id) for movie_id in parsed]
+
+
+def _aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 @router.get("/recommendations/me")
 def my_recommendations(
     request: Request,
@@ -334,6 +429,16 @@ def my_recommendations(
         .order_by(RecommendationSnapshot.rank)
     ).all()
     debug = recommendations_debug_enabled()
+    stored_searches = session.scalars(select(SearchEvent).where(SearchEvent.user_id == user.id)).all()
+    searches = [
+        SearchHit(
+            row.query,
+            _aware(row.created_at),
+            int(row.clicked_movie_id) if row.clicked_movie_id is not None else None,
+            _matched_ids(row.matched_movie_ids),
+        )
+        for row in stored_searches
+    ]
     blended = blended_recommendations(
         service,
         genres=chosen,
@@ -343,13 +448,14 @@ def my_recommendations(
         previous_ids=[int(row.movie_id) for row in previous],
         n=n,
         w_recent_override=w_recent_override if debug else None,
+        searches=searches,
     )
     mode = "genre" if not ratings else recommendation_mode(len(ratings))
     now = datetime.now(timezone.utc)
     session.execute(delete(RecommendationSnapshot).where(RecommendationSnapshot.user_id == user.id))
     session.flush()
     payload = []
-    for rank, item in enumerate(blended, start=1):
+    for rank, item in enumerate(blended.items, start=1):
         session.add(
             RecommendationSnapshot(user_id=user.id, movie_id=item.movie_id, rank=rank, created_at=now)
         )
@@ -359,7 +465,10 @@ def my_recommendations(
         if debug and include_debug:
             card["base_score"] = item.base_score
             card["recent_score"] = item.recent_score
+            card["search_score"] = item.search_score
+            card["w_base"] = item.w_base
             card["w_recent"] = item.w_recent
+            card["w_search"] = item.w_search
             card["snapshot_bonus"] = item.snapshot_bonus
         payload.append(card)
     count = len(ratings)

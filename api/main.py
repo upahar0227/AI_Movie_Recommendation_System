@@ -13,7 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from src.recsys.posters import cached_poster
-from api.library import apply_user_ratings, log_search, rating_map
+from api.library import apply_user_ratings, rating_map
+from src.recsys.search_profile import tie_break_search_results
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from slowapi import _rate_limit_exceeded_handler
@@ -125,7 +126,19 @@ def create_app(
     @app.get("/movies/search")
     def search(request: Request, q: str = Query(min_length=1)) -> dict:
         results = recommender().search(q)
-        _personalise(request, results, search_query=q)
+        user, session = _open_user(request)
+        if user is not None and session is not None:
+            try:
+                scores = rating_map(session, user.id)
+                results = tie_break_search_results(
+                    recommender(),
+                    q,
+                    results,
+                    list(scores.items()),
+                )
+                apply_user_ratings(results, scores)
+            finally:
+                session.close()
         return {"results": results}
 
     @app.get("/recommendations/similar/{movie_id}")
@@ -154,15 +167,12 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"results": [_dump(item) for item in results]}
 
-    def _personalise(request: Request, cards: list[dict], search_query: str | None = None) -> None:
+    def _personalise(request: Request, cards: list[dict]) -> None:
         user, session = _open_user(request)
         if user is None or session is None:
             return
         try:
-            if search_query:
-                log_search(session, user, search_query)
             apply_user_ratings(cards, rating_map(session, user.id))
-            session.commit()
         finally:
             session.close()
 
