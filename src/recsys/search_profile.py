@@ -23,6 +23,8 @@ from .serving import RecommenderService
 
 @dataclass
 class SearchHit:
+    """One stored search: the text, when it was logged, and any click or matches."""
+
     query: str
     created_at: datetime
     clicked_movie_id: int | None = None
@@ -30,12 +32,29 @@ class SearchHit:
 
 
 def normalize_query(text: str) -> str:
+    """Lowercase a query and collapse non-alphanumeric characters to single spaces.
+
+    Args:
+        text: Raw query. Non-strings are converted with str.
+
+    Returns:
+        A stripped, space-separated lowercase string.
+    """
     cleaned = "".join(character.lower() if character.isalnum() else " " for character in str(text))
     return " ".join(cleaned.split())
 
 
 def select_searches(events: list[SearchHit], moment: datetime) -> list[SearchHit]:
-    """Last distinct queries inside the search window, newest first."""
+    """Keep the last distinct queries inside the search window, newest first.
+
+    Args:
+        events: Logged searches. Queries that normalize to fewer than 2 characters
+            are dropped. The same normalized text keeps the newest timestamp.
+        moment: Current time. Events older than SEARCH_WINDOW_DAYS are dropped.
+
+    Returns:
+        At most SEARCH_EVENT_LIMIT hits, newest first.
+    """
     moment = _aware(moment)
     cutoff = moment - timedelta(days=SEARCH_WINDOW_DAYS)
     latest: dict[str, SearchHit] = {}
@@ -58,7 +77,17 @@ def query_vector(
     clicked_movie_id: int | None = None,
     matched_movie_ids: list[int] | None = None,
 ):
-    """One profile row. The query weight is split across the top matches; a click is stronger."""
+    """Build one profile row. The query weight is split across matches; a click is stronger.
+
+    Args:
+        service: Fitted content model used as the vector space.
+        query: Search text, used only when matched_movie_ids has no catalog rows.
+        clicked_movie_id: Movie added at SEARCH_CLICK_STRENGTH. None adds nothing.
+        matched_movie_ids: Movies that share SEARCH_QUERY_STRENGTH equally.
+
+    Returns:
+        A sparse content row, or None when neither the query nor the click maps to a vector.
+    """
     vector = _matched_rows(service, matched_movie_ids or [])
     if vector is None:
         text = normalize_query(query)
@@ -74,6 +103,15 @@ def query_vector(
 
 
 def _matched_rows(service: RecommenderService, movie_ids: list[int]):
+    """Average the named movies' content rows at the query strength.
+
+    Args:
+        service: Content model. Unknown ids are skipped.
+        movie_ids: Match ids. An empty usable list returns None.
+
+    Returns:
+        Their sum, each scaled by SEARCH_QUERY_STRENGTH divided by the usable count.
+    """
     rows = []
     for movie_id in movie_ids:
         row = _movie_row(service, int(movie_id))
@@ -90,7 +128,17 @@ def _matched_rows(service: RecommenderService, movie_ids: list[int]):
 
 
 def search_scores(service: RecommenderService, events: list[SearchHit], moment: datetime) -> np.ndarray:
-    """Cosine similarity of the decayed search profile against every movie."""
+    """Return cosine similarity of the decayed search profile against every movie.
+
+    Args:
+        service: Content and collaborative models. Scores are aligned to the latter.
+        events: Searches passed through select_searches before they are summed.
+        moment: Time used for the window and the half-life decay.
+
+    Returns:
+        Array of shape (n_movies,) in collaborative-model order. Zeros when no
+        selected search produces a vector.
+    """
     width = len(service.collaborative.movie_ids)
     chosen = select_searches(events, moment)
     from .personalised import decay_factor
@@ -114,11 +162,30 @@ def search_scores(service: RecommenderService, events: list[SearchHit], moment: 
 
 
 def tie_break_search_results(service: RecommenderService, query: str, cards: list[dict], ratings: list[tuple[int, float]]) -> list[dict]:
-    """Keep every match. The profile only orders titles that match equally well."""
+    """Keep every match. The profile only orders titles that match equally well.
+
+    Args:
+        service: Content model used for the liked-movie profile.
+        query: Text compared with each card title after normalization.
+        cards: Search dicts with title and movie_id. None are removed.
+        ratings: (movie id, star rating) pairs. Only ratings of 4 or more form the profile.
+
+    Returns:
+        The same cards, exact title first, then prefix, then the rest. Ties break
+        toward the liked-movie profile and then the smaller movie id.
+    """
     text = normalize_query(query)
     profile = _profile_row(service, ratings)
 
     def bucket(card: dict) -> int:
+        """Rank an exact title above a prefix and both above any other match.
+
+        Args:
+            card: Search dict with a title.
+
+        Returns:
+            0 for an exact title, 1 for a prefix, 2 otherwise.
+        """
         title = normalize_query(card.get("title", ""))
         if title == text:
             return 0
@@ -127,6 +194,14 @@ def tie_break_search_results(service: RecommenderService, query: str, cards: lis
         return 2
 
     def profile_boost(card: dict) -> float:
+        """Return cosine similarity between the liked profile and this card.
+
+        Args:
+            card: Search dict with movie_id.
+
+        Returns:
+            Similarity in about -1–1, or 0 when the profile or the movie is missing.
+        """
         if profile is None:
             return 0.0
         index = service.content.id_to_idx.get(int(card["movie_id"]))
@@ -138,6 +213,17 @@ def tie_break_search_results(service: RecommenderService, query: str, cards: lis
 
 
 def _match_vector(service: RecommenderService, text: str):
+    """Map query text to one content row: exact title, metadata, fuzzy title, then TF-IDF.
+
+    Args:
+        service: Catalog and fitted vectorizer.
+        text: Already normalized query.
+
+    Returns:
+        A sparse content row. Fuzzy title matching runs only when the text has at
+        least four characters and the best ratio reaches SEARCH_TITLE_MATCH.
+        None when the text vectorizer also finds no tokens.
+    """
     titles = _titles(service)
     for movie_id, title in titles:
         if title == text:
@@ -159,6 +245,14 @@ def _match_vector(service: RecommenderService, text: str):
 
 
 def _titles(service: RecommenderService) -> list[tuple[int, str]]:
+    """List normalized titles in catalog order.
+
+    Args:
+        service: Movie frame. A frame without a title column returns an empty list.
+
+    Returns:
+        (movie id, normalized title) pairs.
+    """
     pairs = []
     if "title" not in service.movies.columns:
         return pairs
@@ -168,6 +262,15 @@ def _titles(service: RecommenderService) -> list[tuple[int, str]]:
 
 
 def _metadata_row(service: RecommenderService, text: str):
+    """Average content rows whose genre, lead, director, or keywords equal the text.
+
+    Args:
+        service: Movie frame and content matrix.
+        text: Normalized name. Movies not in the content index are skipped.
+
+    Returns:
+        The mean sparse row, or None when no name matches.
+    """
     movies = service.movies
     indexes: list[int] = []
     for position, row in movies.reset_index(drop=True).iterrows():
@@ -185,6 +288,14 @@ def _metadata_row(service: RecommenderService, text: str):
 
 
 def _names(row) -> set[str]:
+    """Collect normalized genre, lead, director, and keyword names from one row.
+
+    Args:
+        row: A movie row. Missing columns are skipped.
+
+    Returns:
+        Normalized name strings. Empty pieces are dropped.
+    """
     found = set()
     if "genre_names" in row.index:
         for part in str(row["genre_names"]).split(","):
@@ -202,6 +313,15 @@ def _names(row) -> set[str]:
 
 
 def _text_row(service: RecommenderService, text: str):
+    """Transform stemmed text, then the raw text, with the fitted vectorizer.
+
+    Args:
+        service: Content model whose vectorizer is already fit.
+        text: Query text.
+
+    Returns:
+        The first non-empty sparse row, or None when both transforms are empty.
+    """
     stemmed = stem_text(text)
     for candidate in (stemmed, text):
         if not candidate.strip():
@@ -213,6 +333,15 @@ def _text_row(service: RecommenderService, text: str):
 
 
 def _movie_row(service: RecommenderService, movie_id: int):
+    """Return one movie's TF-IDF row.
+
+    Args:
+        service: Fitted content model.
+        movie_id: MovieLens id.
+
+    Returns:
+        The sparse matrix row, or None when the id is not in the content index.
+    """
     index = service.content.id_to_idx.get(int(movie_id))
     if index is None:
         return None
@@ -220,6 +349,15 @@ def _movie_row(service: RecommenderService, movie_id: int):
 
 
 def _profile_row(service: RecommenderService, ratings: list[tuple[int, float]]):
+    """Average the content rows of movies rated 4 or higher.
+
+    Args:
+        service: Fitted content model.
+        ratings: (movie id, star rating) pairs. Unknown ids are ignored.
+
+    Returns:
+        The mean sparse row, or None when no liked movie is in the catalog.
+    """
     liked = [movie_id for movie_id, rating in ratings if rating >= 4 and int(movie_id) in service.content.id_to_idx]
     if not liked:
         return None
@@ -228,12 +366,28 @@ def _profile_row(service: RecommenderService, ratings: list[tuple[int, float]]):
 
 
 def _aware(value: datetime) -> datetime:
+    """Return a UTC datetime. A naive value is labeled UTC without shifting the clock.
+
+    Args:
+        value: Timestamp from a search event or the caller.
+
+    Returns:
+        An aware UTC datetime.
+    """
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
 
 
 def _ratio(left: str, right: str) -> float:
+    """Return the SequenceMatcher ratio of two strings.
+
+    Args:
+        left: Normalized query. right: Normalized title. Either empty returns 0.
+
+    Returns:
+        A similarity in 0–1.
+    """
     if not left or not right:
         return 0.0
     from difflib import SequenceMatcher

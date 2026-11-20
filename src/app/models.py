@@ -14,6 +14,11 @@ EVENT_TYPES = ("impression", "click", "rating", "watchlist_add", "search")
 
 
 def _utcnow() -> datetime:
+    """Return the current time as a timezone-aware UTC datetime.
+
+    Returns:
+        The clock time used as the default for account timestamps.
+    """
     return datetime.now(timezone.utc)
 
 
@@ -113,7 +118,7 @@ class SearchEvent(Base):
 
 
 class Interaction(Base):
-    """A single impression, click, rating, or watchlist event."""
+    """A single impression, click, rating, watchlist, or search event."""
 
     __tablename__ = "interactions"
     __table_args__ = (

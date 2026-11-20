@@ -39,6 +39,8 @@ NEUTRAL_RATING = 3.0
 
 @dataclass
 class RatedMovie:
+    """One account rating and the time it was last updated."""
+
     movie_id: int
     rating: float
     updated_at: datetime
@@ -46,6 +48,8 @@ class RatedMovie:
 
 @dataclass
 class ActivityEvent:
+    """A click or watchlist add. Other kinds are ignored by the recent window."""
+
     kind: str
     movie_id: int
     created_at: datetime
@@ -54,6 +58,8 @@ class ActivityEvent:
 
 @dataclass
 class BlendedItem:
+    """One blended recommendation and the scores that produced it."""
+
     movie_id: int
     score: float
     source: str
@@ -69,19 +75,39 @@ class BlendedItem:
 
 @dataclass
 class BlendResult:
+    """The ordered list plus the search-driven movie ids considered for it."""
+
     items: list[BlendedItem]
     search_picks: list[int]
 
 
 def search_weight(n_events: int, w_max: float = S_MAX, k: float = K_S) -> float:
-    """Search influence grows with distinct queries and stops at ``w_max``."""
+    """Return search influence. It grows with distinct queries and stops at ``w_max``.
+
+    Args:
+        n_events: Distinct searches. Zero or less returns 0.
+        w_max: Cap, in 0–1. k: Smoother in ``n / (n + k)``.
+
+    Returns:
+        A weight in 0–w_max.
+    """
     if n_events <= 0:
         return 0.0
     return min(float(w_max), float(n_events) / float(n_events + k))
 
 
 def blend_weights(n_recent: int, n_search: int, *, recent_active: bool, search_active: bool) -> tuple[float, float, float]:
-    """Three weights that sum to 1. A missing signal is dropped and the rest are rescaled."""
+    """Return three weights that sum to 1. A missing signal is dropped and the rest are rescaled.
+
+    Args:
+        n_recent: Recent events passed to recent_weight.
+        n_search: Distinct searches passed to search_weight.
+        recent_active: Use the recent weight only when this is true and n_recent is positive.
+        search_active: Use the search weight only when this is true and n_search is positive.
+
+    Returns:
+        (base, recent, search), each rounded to 10 decimals. All-zero evidence returns (1, 0, 0).
+    """
     w_recent = recent_weight(n_recent) if recent_active and n_recent > 0 else 0.0
     w_search = search_weight(n_search) if search_active and n_search > 0 else 0.0
     w_base = max(0.0, 1.0 - w_recent - w_search)
@@ -92,20 +118,44 @@ def blend_weights(n_recent: int, n_search: int, *, recent_active: bool, search_a
 
 
 def recent_weight(n_events: int, w_max: float = W_RECENT_MAX, k: float = W_RECENT_K) -> float:
-    """Recent activity grows with evidence and stops at ``w_max``."""
+    """Return recent-activity influence. It grows with evidence and stops at ``w_max``.
+
+    Args:
+        n_events: Recent events. Zero or less returns 0.
+        w_max: Cap, in 0–1. k: Smoother in ``n / (n + k)``.
+
+    Returns:
+        A weight in 0–w_max.
+    """
     if n_events <= 0:
         return 0.0
     return min(float(w_max), float(n_events) / float(n_events + k))
 
 
 def decay_factor(age_days: float, half_life_days: float) -> float:
+    """Scale a signal by age. Each half-life cuts the remaining weight in half.
+
+    Args:
+        age_days: Age in days. Negative ages are treated as zero.
+        half_life_days: Days per halving. Zero or less returns 1.
+
+    Returns:
+        A multiplier in 0–1.
+    """
     if half_life_days <= 0:
         return 1.0
     return float(0.5 ** (max(age_days, 0.0) / half_life_days))
 
 
 def rating_signal(rating: float) -> float:
-    """Map a star rating to a profile weight. Implicit signals never use this."""
+    """Map a star rating to a profile weight. Implicit signals never use this.
+
+    Args:
+        rating: Stars. 4 or more maps to the high signal, 2 or less to the low signal.
+
+    Returns:
+        The high, low, or middle signal constant from config.
+    """
     if rating >= 4:
         return SIGNAL_RATING_HIGH
     if rating <= 2:
@@ -114,7 +164,17 @@ def rating_signal(rating: float) -> float:
 
 
 def limit_churn(ranked: list[int], previous: list[int], n: int, fraction: float = CHURN_MAX_FRACTION) -> list[int]:
-    """Keep most of the previous list. New items can fill at most ``fraction`` of ``n``."""
+    """Keep most of the previous list. New items can fill at most ``fraction`` of ``n``.
+
+    Args:
+        ranked: New order. Only these ids may appear in the result.
+        previous: Last snapshot. Ids no longer in ranked are dropped.
+        n: List length. Zero or less returns an empty list.
+        fraction: Maximum share of n that may be new. The rest stay from previous.
+
+    Returns:
+        Up to n ids. With no previous list, this is the head of ranked.
+    """
     if n <= 0:
         return []
     if not previous:
@@ -149,7 +209,17 @@ def mmr_order(
     similarity,
     lam: float = MMR_LAMBDA,
 ) -> list[int]:
-    """Re-rank a fixed set. Higher relevance wins, and near-duplicates are pushed down."""
+    """Re-rank a fixed set. Higher relevance wins, and near-duplicates are pushed down.
+
+    Args:
+        movie_ids: Candidates. The set is not grown or filtered.
+        relevance: Movie id to the score maximised by the first term.
+        similarity: Callable of two movie ids returning a similarity in about 0–1.
+        lam: Weight on relevance. The rest penalises similarity to already picked ids.
+
+    Returns:
+        Every input id, in MMR order. Ties break toward the smaller movie id.
+    """
     np.random.seed(SEED)
     remaining = sorted(movie_ids)
     selected: list[int] = []
@@ -181,7 +251,22 @@ def blended_recommendations(
     w_recent_override: float | None = None,
     searches: list | None = None,
 ) -> BlendResult:
-    """Score the catalog from the long-term profile and a capped recent profile."""
+    """Score the catalog from the long-term profile, recent activity, and searches.
+
+    Rated and watchlisted movies are excluded. A fresh search can reserve slots
+    even when the churn limit would block them. The keyword is not returned.
+
+    Args:
+        service: Fitted models. genres: selected names; with no ratings they also filter.
+        ratings: Account ratings. events: clicks and watchlist adds.
+        watchlist_ids: Ids excluded from the list. previous_ids: last snapshot for churn.
+        n: List length. now: clock; None uses the current UTC time.
+        w_recent_override: Replace the recent weight, still capped by the config maximum.
+        searches: SearchHit values or objects with the same fields. None means no searches.
+
+    Returns:
+        Ordered blended items and up to 10 positive search-score ids when search is active.
+    """
     moment = now or datetime.now(timezone.utc)
     genre_names = _genre_names(service)
     selected = {genre.casefold() for genre in genres}
@@ -286,6 +371,15 @@ def blended_recommendations(
 
 
 def _search_is_fresh(searches: list, moment: datetime) -> bool:
+    """Report whether the newest search is inside the reserved-slot window.
+
+    Args:
+        searches: Hits with created_at. An empty list is not fresh.
+        moment: Current time.
+
+    Returns:
+        True when the newest search is at most SEARCH_SLOT_HOURS old.
+    """
     if not searches:
         return False
     latest = max(_utc(item.created_at) for item in searches)
@@ -299,7 +393,17 @@ def _reserve_search_slots(
     moment: datetime,
     n: int,
 ) -> list[int]:
-    """Keep a few search-driven movies in the list even when the churn limit would block them."""
+    """Keep a few search-driven movies in the list even when the churn limit would block them.
+
+    Args:
+        chosen: Ids already accepted by the churn limit.
+        search_order: Candidates with a positive search score, strongest first.
+        searches: Active searches. Empty, or older than the slot window, leaves chosen unchanged.
+        moment: Current time. n: Maximum length.
+
+    Returns:
+        Up to n ids, with the first SEARCH_MIN_SLOTS search movies inserted if needed.
+    """
     if n <= 0 or not searches or not search_order:
         return chosen
     latest = max(_utc(item.created_at) for item in searches)
@@ -320,7 +424,19 @@ def _reserve_search_slots(
 
 
 def _recent_events(ratings: list[RatedMovie], events: list[ActivityEvent], moment: datetime) -> list[tuple[str, datetime, int, float, str]]:
-    """Ratings in the window plus clicks, watchlist adds, and searches. Newest 30 only."""
+    """Collect ratings, clicks, and watchlist adds inside the recent window.
+
+    Search events are not included. Only the newest RECENT_EVENT_LIMIT rows are kept.
+
+    Args:
+        ratings: Account ratings. A rating counts when its update is inside the window.
+        events: Activity rows. Only click and watchlist_add are kept.
+        moment: Current time.
+
+    Returns:
+        (kind, time, movie id, rating, detail) tuples, newest first. Rating is 0
+        for clicks and watchlist adds.
+    """
     cutoff_seconds = RECENT_WINDOW_DAYS * 86400
     collected: list[tuple[datetime, str, int, float, str]] = []
     for item in ratings:
@@ -345,6 +461,18 @@ def _base_scores(
     genre_names: dict[int, set[str]],
     moment: datetime,
 ) -> np.ndarray:
+    """Score the long-term profile: genre means, or genre means mixed with decayed ratings.
+
+    Args:
+        service: Fitted models.
+        ratings: All account ratings, decayed with the long half-life.
+        selected: Lowercased genre names. Empty yields zeros until ratings exist.
+        genre_names: Movie id to its genre-name set.
+        moment: Current time, used to age each rating.
+
+    Returns:
+        Array of shape (n_movies,). With no ratings this is the genre-mean vector.
+    """
     genre_scores = _genre_mean_scores(service, selected, genre_names)
     if not ratings:
         return genre_scores
@@ -360,6 +488,18 @@ def _recent_scores(
     genre_names: dict[int, set[str]],
     moment: datetime,
 ) -> np.ndarray:
+    """Score recent ratings, watchlist adds, and clicks with the short half-life.
+
+    Args:
+        service: Fitted models.
+        events: Tuples from _recent_events. An empty list returns zeros.
+        genre_names: Unused. Kept so callers can pass the catalog genre map.
+        moment: Current time.
+
+    Returns:
+        Array of shape (n_movies,). Hybrid scores when a recent rating exists,
+        otherwise content similarity only.
+    """
     width = len(service.collaborative.movie_ids)
     if not events:
         return np.zeros(width, dtype=np.float64)
@@ -382,6 +522,16 @@ def _recent_scores(
 
 
 def _rating_vectors(ratings: list[RatedMovie], moment: datetime, half_life: float) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    """Decay each rating into a content weight and an SVD rating.
+
+    Args:
+        ratings: Account ratings.
+        moment: Current time.
+        half_life: Days per halving of the signal and of the distance from 3 stars.
+
+    Returns:
+        Content (movie id, signed weight) pairs and SVD (movie id, decayed star) pairs.
+    """
     weights: list[tuple[int, float]] = []
     explicit: list[tuple[int, float]] = []
     for item in ratings:
@@ -398,6 +548,18 @@ def _hybrid_from_weights(
     explicit: list[tuple[int, float]],
     queries: list[tuple[str, float]] | None = None,
 ) -> np.ndarray:
+    """Blend content, SVD, popularity, and reception from weighted ratings.
+
+    Args:
+        service: Fitted models, including hybrid_k, hybrid_beta, and sentiment.
+        weights: Signed content weights.
+        explicit: (movie id, star) pairs. Their count sets the hybrid alpha.
+        queries: Optional text weights. None adds no text.
+
+    Returns:
+        Array of shape (n_movies,) from hybrid_scores. A sentiment vector of the
+        wrong length is replaced with zeros.
+    """
     content = _content_scores(service, weights, queries or [])
     popularity = service.collaborative.popularity_scores()
     svd = service.collaborative.svd_scores(explicit)
@@ -421,6 +583,16 @@ def _content_scores(
     weights: list[tuple[int, float]],
     queries: list[tuple[str, float]],
 ) -> np.ndarray:
+    """Score the catalog by cosine similarity to a weighted sum of movie and text vectors.
+
+    Args:
+        service: Content model. Unknown movie ids and zero weights are skipped.
+        weights: (movie id, signed weight) pairs.
+        queries: (text, weight) pairs transformed by the fitted vectorizer.
+
+    Returns:
+        Array of shape (n_movies,) in collaborative order. Zeros when nothing contributes.
+    """
     matrix = service.content.matrix
     combined = None
     for movie_id, weight in weights:
@@ -447,6 +619,16 @@ def _content_scores(
 
 
 def _genre_mean_scores(service: RecommenderService, selected: set[str], genre_names: dict[int, set[str]]) -> np.ndarray:
+    """Place each matching movie's item mean on the collaborative index.
+
+    Args:
+        service: Source of movie order and item means.
+        selected: Lowercased genre names. Empty returns zeros.
+        genre_names: Movie id to genre names. Matching is case-insensitive.
+
+    Returns:
+        Array of shape (n_movies,). Non-matching movies stay 0.
+    """
     scores = np.zeros(len(service.collaborative.movie_ids), dtype=np.float64)
     if not selected:
         return scores
@@ -463,6 +645,17 @@ def _add_search_genre_weights(
     genre_names: dict[int, set[str]],
     weight: float,
 ) -> None:
+    """Append a content weight for every movie whose genre matches a query token.
+
+    Args:
+        weights: List mutated in place.
+        query: Text split on whitespace. An empty token set returns immediately.
+        genre_names: Movie id to genre names.
+        weight: Value appended with each matching movie id.
+
+    Side effects:
+        Appends (movie id, weight) pairs to weights. Does not remove existing pairs.
+    """
     tokens = {token.casefold() for token in query.split() if token.strip()}
     if not tokens:
         return
@@ -490,6 +683,23 @@ def _reason(
     weight: float | None = None,
     forced: bool = False,
 ) -> tuple[str, str]:
+    """Choose the reason whose weighted pull is largest.
+
+    A forced search, or a search pull that beats the other pulls, wins. Otherwise
+    the recent reason wins only when its pull beats the base pull.
+
+    Args:
+        service: Titles similar movies. movie_id: the card. genres: selected names.
+        genre_names: Movie id to genre names. ratings: long-term ratings. events: recent tuples.
+        searches: Active searches, or None to skip that reason.
+        base_score, recent_score, search_score: normalised pulls before weights.
+        w_base, w_recent, w_search: blend weights. moment: current time.
+        weight: legacy recent weight, used only when w_recent is 0.
+        forced: Use the search reason even when its numeric pull is smaller.
+
+    Returns:
+        A source label and a sentence that does not include the query text.
+    """
     if weight is not None and w_recent == 0:
         w_recent = weight
         w_base = max(0.0, 1.0 - weight)
@@ -508,6 +718,17 @@ def _reason(
 
 
 def _search_reason(service: RecommenderService, movie_id: int, searches: list) -> tuple[str, str]:
+    """Explain a search hit without naming the query.
+
+    Args:
+        service: Used to title the clicked movie.
+        movie_id: Recommended movie.
+        searches: Active hits. Only rows with a clicked movie id are compared.
+
+    Returns:
+        ("search", "Similar to {title}") for the most similar clicked movie, otherwise
+        ("search", "Based on your recent activity").
+    """
     best_title = ""
     best_score = 0.0
     for event in searches:
@@ -532,6 +753,19 @@ def _profile_reason(
     moment: datetime,
     half_life: float,
 ) -> tuple[str, str]:
+    """Pick the strongest rating, watchlist, or old search-detail reason.
+
+    Args:
+        service: Content model and titles. movie_id: card being explained.
+        ratings: Ratings scored with rating_signal. Non-positive signals are skipped.
+        events: Recent tuples. Search rows still in this list can match on detail text.
+        genres: Selected names. genre_names: movie id to genre names.
+        moment: Current time. half_life: days used to decay each signal.
+
+    Returns:
+        (source, sentence). With no positive signal, a genre overlap returns
+        ("genres", "From your genres"); otherwise the same default.
+    """
     best_score = 0.0
     best = ("genres", "From your genres")
     target = service.content.id_to_idx.get(int(movie_id))
@@ -571,6 +805,15 @@ def _profile_reason(
 
 
 def _similarity(service: RecommenderService, left: int, right: int) -> float:
+    """Return content cosine similarity of two movies.
+
+    Args:
+        service: Fitted content model.
+        left: First movie id. right: second movie id. The same id returns 1.
+
+    Returns:
+        Cosine similarity, or 0 when either id is missing from the content index.
+    """
     if int(left) == int(right):
         return 1.0
     left_index = service.content.id_to_idx.get(int(left))
@@ -581,6 +824,14 @@ def _similarity(service: RecommenderService, left: int, right: int) -> float:
 
 
 def _genre_names(service: RecommenderService) -> dict[int, set[str]]:
+    """Map each movie id to its genre-name set.
+
+    Args:
+        service: Movie frame with genre_names. Missing or "nan" text becomes an empty set.
+
+    Returns:
+        movie id to stripped genre names. The names are not case-folded.
+    """
     mapping: dict[int, set[str]] = {}
     frame = service.movies
     for _, row in frame.iterrows():
@@ -592,10 +843,27 @@ def _genre_names(service: RecommenderService) -> dict[int, set[str]]:
 
 
 def _folded(names: set[str]) -> set[str]:
+    """Return the names in case-folded form.
+
+    Args:
+        names: Genre strings.
+
+    Returns:
+        The same names compared without case.
+    """
     return {name.casefold() for name in names}
 
 
 def _normalise_selected(scores: np.ndarray, indexes: list[int]) -> np.ndarray:
+    """Min-max the scores at the candidate indexes and leave every other position at 0.
+
+    Args:
+        scores: One score per collaborative movie.
+        indexes: Positions allowed into the blend. Empty returns zeros.
+
+    Returns:
+        Array of the same shape. Only indexes are in 0–1.
+    """
     normalised = np.zeros_like(scores, dtype=np.float64)
     if not indexes:
         return normalised
@@ -607,6 +875,14 @@ def _normalise_selected(scores: np.ndarray, indexes: list[int]) -> np.ndarray:
 
 
 def _utc(value: datetime) -> datetime:
+    """Return a UTC datetime. A naive value is labeled UTC without shifting the clock.
+
+    Args:
+        value: Rating, event, or caller timestamp.
+
+    Returns:
+        An aware UTC datetime.
+    """
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)

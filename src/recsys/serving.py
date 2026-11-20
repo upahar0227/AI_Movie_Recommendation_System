@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Recommendation:
+    """One movie card returned to the site, including score and display text."""
+
     movie_id: int
     title: str
     genres: str
@@ -42,6 +44,12 @@ class Recommendation:
     reason: str = ""
 
     def to_dict(self) -> dict:
+        """Return the JSON fields for this card.
+
+        Returns:
+            Movie id, title, genres, rounded score, explanation, poster, credits,
+            community-rating fields, source, and reason. An empty reason uses explanation.
+        """
         return {
             "movie_id": self.movie_id,
             "title": self.title,
@@ -80,6 +88,15 @@ class RecommenderService:
     reception_method: str
 
     def search(self, query: str, limit: int = 10) -> list[dict]:
+        """Find titles that contain the query, case-insensitively.
+
+        Args:
+            query: Substring matched against title. Blank text returns no rows.
+            limit: Maximum cards. Matching is not a regex.
+
+        Returns:
+            Summary dicts in catalog order, not ranked by similarity.
+        """
         text = query.strip().lower()
         if not text:
             return []
@@ -87,19 +104,47 @@ class RecommenderService:
         return [self._summary(row) for _, row in matches.iterrows()]
 
     def similar(self, movie_id: int, n: int = 10) -> list[Recommendation]:
+        """Return content neighbours of one movie.
+
+        Args:
+            movie_id: Query MovieLens id.
+            n: Maximum neighbours.
+
+        Returns:
+            Cards explained as "similar genres and cast".
+
+        Raises:
+            KeyError: movie_id is not in the content model.
+        """
         if int(movie_id) not in self.content.id_to_idx:
             raise KeyError(f"Unknown movie id {movie_id}")
         pairs = self.content.recommend_similar(int(movie_id), n)
         return [self._recommendation(movie_id, score, "similar genres and cast") for movie_id, score in pairs]
 
     def for_user(self, user_id: int, n: int = 10) -> list[Recommendation]:
+        """Recommend from a MovieLens user's saved training history.
+
+        Args:
+            user_id: MovieLens user id stored in the artifact.
+            n: Maximum cards.
+
+        Returns:
+            Hybrid cards that exclude movies already in that history.
+
+        Raises:
+            KeyError: user_id is not in the artifact histories.
+        """
         history = self.histories.get(int(user_id))
         if history is None:
             raise KeyError(f"Unknown user id {user_id}")
         return self._from_ratings(history, n)
 
     def catalog_genres(self) -> list[str]:
-        """Unique genre names stored on the movie frame."""
+        """Return the unique genre names stored on the movie frame.
+
+        Returns:
+            Sorted genre strings. Blank parts and the text "nan" are dropped.
+        """
         names: set[str] = set()
         for raw in self.movies["genre_names"].fillna(""):
             for part in str(raw).split(","):
@@ -109,7 +154,16 @@ class RecommenderService:
         return sorted(names)
 
     def top_rated_for_genres(self, genres: list[str], exclude: set[int], n: int = 10) -> list[Recommendation]:
-        """Highest average MovieLens ratings among movies in the chosen genres."""
+        """Return the highest average MovieLens ratings among movies in the chosen genres.
+
+        Args:
+            genres: Genre names, matched case-insensitively. Any overlap counts.
+            exclude: Movie ids to skip.
+            n: Maximum cards.
+
+        Returns:
+            Cards ordered by item mean, then by rating count. The explanation names the genres.
+        """
         wanted = {genre.casefold() for genre in genres}
         label = ", ".join(genres)
         by_id = self.movies.set_index("movieId")
@@ -129,7 +183,17 @@ class RecommenderService:
         ]
 
     def describe(self, movie_id: int) -> dict:
-        """Title and genres for a catalog id, used by ratings and the watchlist."""
+        """Return title, genres, and display fields for a catalog id.
+
+        Used by ratings and the watchlist. An unknown id still returns a card
+        titled "Movie {id}" with empty community scores.
+
+        Args:
+            movie_id: MovieLens id.
+
+        Returns:
+            The same summary dict shape as search results.
+        """
         matches = self.movies.loc[self.movies["movieId"] == int(movie_id)]
         if matches.empty:
             return {
@@ -151,6 +215,16 @@ class RecommenderService:
         n: int = 10,
         clicks: list[int] | None = None,
     ) -> list[Recommendation]:
+        """Recommend from an account's ratings, ignoring ids outside the catalog.
+
+        Args:
+            ratings: (movie id, star rating) pairs.
+            n: Maximum cards.
+            clicks: Movie ids added to the content profile. None means no clicks.
+
+        Returns:
+            Hybrid cards, or popularity cards when there are no known ratings and no clicks.
+        """
         known = [
             (int(movie_id), float(rating))
             for movie_id, rating in ratings
@@ -164,6 +238,17 @@ class RecommenderService:
         n: int,
         clicks: list[int] | None = None,
     ) -> list[Recommendation]:
+        """Blend content, SVD, and reception, or fall back to popularity.
+
+        Args:
+            ratings: Known (movie id, rating) pairs. They are excluded from the list.
+            n: Maximum cards.
+            clicks: Clicked ids. They change content scores only when the list is non-empty.
+
+        Returns:
+            Popularity cards when both inputs are empty. Content-only cards when
+            there are clicks but no ratings. Otherwise sentiment-aware hybrid cards.
+        """
         popularity = self.collaborative.popularity_scores()
         if not ratings and not clicks:
             ranked = _top(popularity, self.collaborative.movie_ids, set(), n)
@@ -195,7 +280,15 @@ class RecommenderService:
         return [self._recommendation(movie_id, score, self._explain(movie_id, ratings)) for movie_id, score in ranked]
 
     def _align_content(self, scores: np.ndarray) -> np.ndarray:
-        """Put content scores in collaborative-model order. Movies missing there stay 0."""
+        """Put content scores in collaborative-model order. Movies missing there stay 0.
+
+        Args:
+            scores: Content scores in content-model order, or already aligned.
+
+        Returns:
+            Array of shape (n_collaborative_movies,). The input is reused when the
+            two movie-id sequences are identical.
+        """
         if len(scores) == len(self.collaborative.movie_ids):
             same = all(int(movie_id) in self.content.id_to_idx for movie_id in self.collaborative.movie_ids)
             if same and list(self.collaborative.movie_ids) == [int(movie_id) for movie_id in self.content.movie_ids]:
@@ -208,6 +301,18 @@ class RecommenderService:
         return aligned
 
     def _explain(self, movie_id: int, ratings: list[tuple[int, float]]) -> str:
+        """Explain a card from the closest liked movie, or from the blend weight.
+
+        Args:
+            movie_id: Recommended movie.
+            ratings: Ratings used to build the profile. Only scores of 4 or more
+                compete as the "because you rated" title.
+
+        Returns:
+            "Because you rated {title}" when a liked movie is similar. Otherwise
+            genres and cast when alpha is below 0.5, or "highly rated by users".
+            A positive beta appends an audience-reception clause when ratings exist.
+        """
         liked = [int(liked_id) for liked_id, rating in ratings if rating >= MIN_RATING_LIKED and int(liked_id) in self.content.id_to_idx]
         target = self.content.id_to_idx.get(int(movie_id))
         best_id = None
@@ -231,12 +336,28 @@ class RecommenderService:
         return text
 
     def _title(self, movie_id: int) -> str:
+        """Return the catalog title, or "movie {id}" when the id is absent.
+
+        Args:
+            movie_id: MovieLens id.
+
+        Returns:
+            The title string.
+        """
         matches = self.movies.loc[self.movies["movieId"] == int(movie_id)]
         if matches.empty:
             return f"movie {movie_id}"
         return str(matches.iloc[0]["title"])
 
     def _summary(self, row: pd.Series) -> dict:
+        """Build the display dict for one movie row.
+
+        Args:
+            row: A movies-frame row with movieId, title, and optional display columns.
+
+        Returns:
+            movie_id, title, genres, poster, credits, link, and community fields.
+        """
         return {
             "movie_id": int(row["movieId"]),
             "title": str(row["title"]),
@@ -250,6 +371,17 @@ class RecommenderService:
         }
 
     def _recommendation(self, movie_id: int, score: float, explanation: str, source: str = "", reason: str = "") -> Recommendation:
+        """Build a card from a catalog row and a score.
+
+        Args:
+            movie_id: MovieLens id that must exist in the movies frame.
+            score: Ranker score, stored rounded to 4 decimals.
+            explanation: Text used when reason is empty.
+            source: Short source label. reason: display sentence; empty copies explanation.
+
+        Returns:
+            A Recommendation filled from the movie row.
+        """
         row = self.movies.loc[self.movies["movieId"] == int(movie_id)].iloc[0]
         card = self._summary(row)
         return Recommendation(
@@ -277,6 +409,11 @@ class RecommenderService:
 
 
 def _empty_community() -> dict:
+    """Return community-rating fields with no score.
+
+    Returns:
+        Null averages and counts, rating_scale 10, and a null source.
+    """
     return {
         "avg_rating": None,
         "rating_count": None,
@@ -290,6 +427,14 @@ def _empty_community() -> dict:
 
 
 def _community(row: pd.Series) -> dict:
+    """Read community-rating columns from a movie row.
+
+    Args:
+        row: A row that may omit any of the community columns.
+
+    Returns:
+        The community dict. A missing scale becomes 10. Missing numbers stay None.
+    """
     payload = _empty_community()
     payload["avg_rating"] = _number(row.get("avg_rating"))
     payload["rating_count"] = _count(row.get("rating_count"))
@@ -304,6 +449,14 @@ def _community(row: pd.Series) -> dict:
 
 
 def _number(value: object) -> float | None:
+    """Convert a cell to float, treating missing values as None.
+
+    Args:
+        value: A number, None, or a pandas missing value.
+
+    Returns:
+        The float, or None when the cell is missing.
+    """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
     try:
@@ -315,6 +468,14 @@ def _number(value: object) -> float | None:
 
 
 def _count(value: object) -> int | None:
+    """Convert a cell to int after the same missing-value check as _number.
+
+    Args:
+        value: A count cell.
+
+    Returns:
+        The truncated int, or None when _number returns None.
+    """
     number = _number(value)
     if number is None:
         return None
@@ -322,6 +483,14 @@ def _count(value: object) -> int | None:
 
 
 def _text(value: object) -> str | None:
+    """Return stripped text, or None for missing, blank, or "nan" cells.
+
+    Args:
+        value: A display cell.
+
+    Returns:
+        The stripped string, or None.
+    """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
     text = str(value).strip()
@@ -331,6 +500,17 @@ def _text(value: object) -> str | None:
 
 
 def _top(scores: np.ndarray, movie_ids: np.ndarray, exclude: set[int], limit: int) -> list[tuple[int, float]]:
+    """Return the highest scores, skipping excluded ids.
+
+    Args:
+        scores: One score per movie, aligned with movie_ids.
+        movie_ids: Catalog ids.
+        exclude: Ids to skip.
+        limit: Maximum pairs.
+
+    Returns:
+        (movie id, score) pairs, highest score first.
+    """
     order = np.argsort(-scores)
     picked: list[tuple[int, float]] = []
     for index in order:
@@ -344,12 +524,35 @@ def _top(scores: np.ndarray, movie_ids: np.ndarray, exclude: set[int], limit: in
 
 
 def save_artifact(path, payload: dict) -> None:
+    """Write the trained models with joblib.
+
+    Args:
+        path: Destination file. Its parent directory is created when missing.
+        payload: Artifact dict consumed by load_service.
+
+    Side effects:
+        Creates the parent directory, overwrites the file, and logs the path.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(payload, path)
     logger.info("Saved artifact to %s", path)
 
 
 def load_service(path=None) -> RecommenderService:
+    """Load the joblib artifact and attach display fields.
+
+    Args:
+        path: Artifact file. None uses data/processed/artifacts/recommender.joblib.
+
+    Returns:
+        A service whose movie frame includes posters, credits, and community scores.
+
+    Raises:
+        FileNotFoundError: The artifact file does not exist.
+
+    Side effects:
+        Reads the artifact and the raw csv files used by enrich_display.
+    """
     artifact_path = path or (ARTIFACT_DIR / "recommender.joblib")
     if not artifact_path.is_file():
         raise FileNotFoundError(
