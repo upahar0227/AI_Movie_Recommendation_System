@@ -47,6 +47,10 @@ button.ghost { background: transparent; color: #f3eee6; border: 1px solid #3c342
 .half.on { background: #e2a15a; }
 .star:has(.half.on)::before { content: "★"; color: #e2a15a; }
 .clear-rating { padding: 4px 8px; }
+.icon-button { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; padding: 0; border: 0; border-radius: 10px; background: transparent; color: inherit; }
+.icon-button:hover, .icon-button:focus-visible { background: #2a241c; outline: 2px solid #e2a15a; outline-offset: 1px; }
+.search-panel { position: fixed; z-index: 30; top: 16px; left: 16px; right: 16px; max-width: 640px; margin: 0 auto; padding: 14px; border: 1px solid #3c342c; border-radius: 14px; background: #1c1916; box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35); max-height: calc(100vh - 32px); overflow: auto; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); border: 0; }
 .muted { color: #b3a89a; font-size: 14px; }
 .error { color: #e07a6a; min-height: 1.2em; }
 .hidden, [hidden] { display: none !important; }

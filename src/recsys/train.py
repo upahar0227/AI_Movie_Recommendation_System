@@ -24,6 +24,14 @@ logger = logging.getLogger(__name__)
 
 
 def _histories(ratings: pd.DataFrame) -> dict[int, list[tuple[int, float]]]:
+    """Group ratings into per-user histories in file order.
+
+    Args:
+        ratings: Rows with userId, movieId, and rating.
+
+    Returns:
+        user id to a list of (movie id, rating) pairs.
+    """
     grouped: dict[int, list[tuple[int, float]]] = defaultdict(list)
     for user_id, movie_id, rating in ratings[["userId", "movieId", "rating"]].itertuples(index=False):
         grouped[int(user_id)].append((int(movie_id), float(rating)))
@@ -31,6 +39,15 @@ def _histories(ratings: pd.DataFrame) -> dict[int, list[tuple[int, float]]]:
 
 
 def main() -> int:
+    """Preprocess, train, evaluate, and save the serving artifact.
+
+    Returns:
+        0 after the artifact is written. Missing datasets raise from the loader.
+
+    Side effects:
+        Writes movies.csv, evaluation csv files, plots, and recommender.joblib.
+        Configures the root logger.
+    """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)

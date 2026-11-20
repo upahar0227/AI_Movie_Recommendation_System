@@ -55,6 +55,12 @@ class SentimentReport:
 
 
 def _pipelines() -> dict[str, Pipeline]:
+    """Build unfitted TF-IDF classifiers for the three sentiment models.
+
+    Returns:
+        Logistic regression, multinomial naive Bayes, and random forest.
+        Each vectorizer is capped at 10000 features and is not yet fit.
+    """
     return {
         "logistic_regression": Pipeline(
             [
@@ -86,7 +92,20 @@ def _pipelines() -> dict[str, Pipeline]:
 
 
 def train_sentiment(reviews: pd.DataFrame) -> SentimentReport:
-    """Stratified 80/20 split. The vectorizer is fit on the training split only."""
+    """Train three classifiers on a stratified 80/20 split and keep the best F1.
+
+    The vectorizer is fit on the training split only. Positive labels are reviews
+    whose sentiment text is "positive".
+
+    Args:
+        reviews: IMDb rows with ``review`` and ``sentiment``. Nulls in either are dropped.
+
+    Returns:
+        Held-out metrics, the highest-F1 pipeline, and the MovieLens fallback method name.
+
+    Side effects:
+        Writes sentiment metric csv files and a precision-recall plot under results.
+    """
     frame = reviews.dropna(subset=["review", "sentiment"]).copy()
     labels = (frame["sentiment"].str.lower() == "positive").astype(int)
     texts = frame["review"].astype(str)
@@ -137,6 +156,18 @@ def _save_sentiment_plots(
     matrices: dict[str, np.ndarray],
     best_name: str,
 ) -> None:
+    """Save sentiment metrics, the best confusion matrix, and the precision-recall plot.
+
+    Args:
+        metrics: One row per model, already sorted by the caller.
+        curves: Model name to (recall, precision) arrays.
+        matrices: Model name to a 2x2 confusion matrix ordered negative then positive.
+        best_name: Model whose matrix is written to csv.
+
+    Side effects:
+        Creates the results directory and writes sentiment_metrics.csv,
+        sentiment_confusion_matrix.csv, and sentiment_pr.png.
+    """
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     metrics.to_csv(RESULTS_DIR / "sentiment_metrics.csv", index=False)
     confusion = matrices[best_name]
@@ -159,6 +190,15 @@ def bayesian_reception(ratings: pd.DataFrame, movie_ids: np.ndarray, prior_stren
     """Bayesian average rating, scaled from the 0.5–5 star range into 0–1.
 
     This is the explicit fallback used when TMDB review text is not available.
+    Unrated movies use the global mean with a count of zero.
+
+    Args:
+        ratings: Rows with movieId and rating, on the 0.5–5 star scale.
+        movie_ids: Catalog ids, one output position each.
+        prior_strength: Pseudo-count of the global mean. Default is 20.
+
+    Returns:
+        Array of shape (n_movies,) in 0–1, scaled as (average - 0.5) / 4.5.
     """
     grouped = ratings.groupby("movieId")["rating"].agg(["mean", "count"])
     global_mean = float(ratings["rating"].mean()) if len(ratings) else 3.0
@@ -180,7 +220,21 @@ def tmdb_review_scores(
     model: Pipeline,
     api_key: str,
 ) -> np.ndarray | None:
-    """Average predicted positive probability of TMDB reviews. None if the API cannot be used."""
+    """Average the predicted positive probability of each movie's TMDB reviews.
+
+    Args:
+        movie_ids: Catalog ids. Only the length is used.
+        tmdb_ids: TMDB ids aligned with movie_ids.
+        model: Fitted sentiment pipeline with predict_proba.
+        api_key: TMDB key sent as the reviews-endpoint query parameter.
+
+    Returns:
+        Array of shape (n_movies,) with NaN where a movie has no review text.
+        None when any request fails or every score is NaN.
+
+    Side effects:
+        Calls the TMDB reviews API once per movie and logs progress and failures.
+    """
     scores = np.full(len(movie_ids), np.nan, dtype=np.float64)
     for index, tmdb_id in enumerate(tmdb_ids):
         url = f"https://api.themoviedb.org/3/movie/{int(tmdb_id)}/reviews?api_key={api_key}"
@@ -205,7 +259,20 @@ def movie_reception_scores(
     movies: pd.DataFrame,
     model: Pipeline | None,
 ) -> tuple[np.ndarray, str]:
-    """Prefer TMDB review sentiment. Otherwise use the MovieLens Bayesian average."""
+    """Prefer TMDB review sentiment. Otherwise use the MovieLens Bayesian average.
+
+    Args:
+        ratings: MovieLens ratings used for the Bayesian fallback.
+        movies: Catalog with movieId and tmdbId.
+        model: Fitted sentiment pipeline. Required, with TMDB_API_KEY, for the TMDB path.
+
+    Returns:
+        Scores of shape (n_movies,) and a method label: tmdb review sentiment, or
+        the Bayesian MovieLens fallback. Missing TMDB scores are filled from that fallback.
+
+    Side effects:
+        Reads TMDB_API_KEY and may call the TMDB reviews API. Logs which source was used.
+    """
     movie_ids = movies["movieId"].astype(int).to_numpy()
     api_key = os.environ.get("TMDB_API_KEY", "").strip()
     if api_key and model is not None:

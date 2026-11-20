@@ -39,7 +39,17 @@ TUNE_BETA = (0.0, 0.1, 0.15, 0.3)
 
 
 def top_ids(scores: np.ndarray, movie_ids: np.ndarray, exclude: set[int], limit: int) -> list[int]:
-    """Highest-scoring movies, skipping ids in ``exclude``."""
+    """Return the highest-scoring movies, skipping ids in ``exclude``.
+
+    Args:
+        scores: One score per movie, aligned with movie_ids.
+        movie_ids: Catalog ids in the same order as scores.
+        exclude: Ids already known to the user.
+        limit: Maximum ids to return.
+
+    Returns:
+        Movie ids, highest score first.
+    """
     order = np.argsort(-scores)
     picked: list[int] = []
     for index in order:
@@ -53,6 +63,14 @@ def top_ids(scores: np.ndarray, movie_ids: np.ndarray, exclude: set[int], limit:
 
 
 def _histories(ratings: pd.DataFrame) -> dict[int, list[tuple[int, float]]]:
+    """Group ratings into per-user histories in file order.
+
+    Args:
+        ratings: Rows with userId, movieId, and rating.
+
+    Returns:
+        user id to a list of (movie id, rating) pairs.
+    """
     grouped: dict[int, list[tuple[int, float]]] = defaultdict(list)
     for user_id, movie_id, rating in ratings[["userId", "movieId", "rating"]].itertuples(index=False):
         grouped[int(user_id)].append((int(movie_id), float(rating)))
@@ -68,6 +86,20 @@ def _score_user(
     k_param: float,
     beta: float,
 ) -> np.ndarray:
+    """Score every movie with one named ranker.
+
+    Args:
+        name: One of popularity, content, item_knn, svd, hybrid, or hybrid_sentiment.
+        ratings: The user's known (movie id, rating) pairs.
+        content: Fitted content model.
+        collaborative: Filters fit on the training rows.
+        sentiment: Reception vector aligned with the collaborative movie index.
+        k_param: Hybrid smoothing constant.
+        beta: Sentiment weight. Used only for hybrid_sentiment.
+
+    Returns:
+        Array of shape (n_movies,) in that ranker's own score units.
+    """
     popularity = collaborative.popularity_scores()
     if name == "popularity":
         return popularity
@@ -92,6 +124,20 @@ def _score_user(
 
 
 def _rating_prediction(name: str, scores: np.ndarray, collaborative: CollaborativeModels, item_index: int) -> float:
+    """Turn a ranker score into a star prediction for error metrics.
+
+    Popularity always uses the item mean. Item-kNN uses the item mean when its
+    neighbor score is 0. Other models use the score at item_index as-is.
+
+    Args:
+        name: popularity, item_knn, or svd.
+        scores: That model's score vector.
+        collaborative: Source of the per-item mean rating.
+        item_index: Column of the movie being scored.
+
+    Returns:
+        A predicted star rating.
+    """
     if name == "popularity":
         return float(collaborative.item_mean[item_index])
     predicted = float(scores[item_index])
@@ -105,7 +151,19 @@ def tune_hybrid(
     train_ratings: pd.DataFrame,
     content: ContentModel,
 ) -> tuple[float, float]:
-    """Pick k and beta on an inner hold-out carved from the training ratings only."""
+    """Pick k and beta on an inner hold-out carved from the training ratings only.
+
+    Args:
+        movies: Catalog passed to the collaborative fit.
+        train_ratings: Outer-fold training rows. Fold 0 of a fresh 5-fold split is the inner test.
+        content: Content model already fit on the full catalog.
+
+    Returns:
+        The k and beta with the highest mean NDCG@10 of hybrid_sentiment.
+
+    Side effects:
+        Logs each candidate and the selected pair.
+    """
     inner_train, inner_test = per_user_folds(train_ratings, n_folds=5, seed=SEED + 1)[0]
     collaborative = fit_collaborative(movies, inner_train)
     sentiment = bayesian_reception(inner_train, movies["movieId"].astype(int).to_numpy())
@@ -141,6 +199,21 @@ def _ndcg_values(
     k_param: float,
     beta: float,
 ) -> list[float]:
+    """Compute NDCG@10 for each test user who liked at least one held-out movie.
+
+    Args:
+        model_name: Ranker name passed to _score_user.
+        test_ratings: Held-out rows. A user with no rating of 4 or more is skipped.
+        histories: Training history by user id.
+        content: Fitted content model.
+        collaborative: Filters fit without the test rows.
+        sentiment: Reception vector for this training split.
+        k_param: Hybrid smoothing constant.
+        beta: Sentiment weight.
+
+    Returns:
+        One NDCG@10 per scored user, in groupby order.
+    """
     values: list[float] = []
     for user_id, group in test_ratings.groupby("userId"):
         relevant = group.loc[group["rating"] >= MIN_RATING_LIKED]
@@ -162,7 +235,20 @@ def evaluate_fold(
     k_param: float,
     beta: float,
 ) -> tuple[pd.DataFrame, dict[str, dict[int, float]], dict[str, tuple[list[float], list[float]]]]:
-    """Fit collaborative models on the fold's training rows and score the test rows."""
+    """Fit collaborative models on the fold's training rows and score the test rows.
+
+    Args:
+        movies: Catalog. train_ratings: rows used to fit. test_ratings: held-out rows.
+        content: Content model. k_param: hybrid k. beta: hybrid sentiment weight.
+
+    Returns:
+        Mean precision, recall, F1, NDCG, and coverage@10 per ranker; NDCG@10 by
+        user for users with a liked test movie; and paired actual and predicted
+        stars for popularity, item-kNN, and SVD.
+
+    Side effects:
+        Logs the number of test users.
+    """
     collaborative = fit_collaborative(movies, train_ratings)
     sentiment = bayesian_reception(train_ratings, movies["movieId"].astype(int).to_numpy())
     histories = _histories(train_ratings)
@@ -239,7 +325,19 @@ def cold_start_curve(
     beta: float,
     sample_size: int = 120,
 ) -> pd.DataFrame:
-    """NDCG@10 when each sampled user keeps only 1, 3, 5, or 10 training ratings."""
+    """Measure NDCG@10 when each sampled user keeps only 1, 3, 5, or 10 training ratings.
+
+    Args:
+        movies: Catalog. train_ratings and test_ratings: one outer fold.
+        content: Content model. k_param: hybrid k. beta: hybrid sentiment weight.
+        sample_size: Maximum users who have at least 10 training ratings and a test row.
+
+    Returns:
+        Columns known_ratings, model, ndcg@10, and users.
+
+    Side effects:
+        Logs the sample size and each known-rating count.
+    """
     collaborative = fit_collaborative(movies, train_ratings)
     sentiment = bayesian_reception(train_ratings, movies["movieId"].astype(int).to_numpy())
     histories = _histories(train_ratings)
@@ -281,6 +379,17 @@ def cold_start_curve(
 
 
 def _significance(per_user: dict[str, dict[int, list[float]]]) -> pd.DataFrame:
+    """Compare hybrid NDCG@10 with each other ranker on shared users.
+
+    Args:
+        per_user: Ranker name to user id to the NDCG values collected across folds.
+            Each user's values are averaged before the paired tests.
+
+    Returns:
+        One row per baseline with Wilcoxon and paired-t statistics against hybrid.
+        Tests are NaN when fewer than 10 users differ. significant_0.05 uses the
+        Wilcoxon p-value and the configured alpha.
+    """
     hybrid_users = per_user["hybrid"]
     rows = []
     for baseline in RANKERS:
@@ -312,7 +421,20 @@ def _significance(per_user: dict[str, dict[int, list[float]]]) -> pd.DataFrame:
 
 
 def run_evaluation(movies: pd.DataFrame, ratings: pd.DataFrame, content: ContentModel) -> dict[str, pd.DataFrame]:
-    """5-fold per-user evaluation, significance tests, and the cold-start curve."""
+    """Run 5-fold per-user evaluation, significance tests, and the cold-start curve.
+
+    Hybrid k and beta are tuned on the first fold's training rows, then reused.
+
+    Args:
+        movies: Tagged catalog. ratings: all MovieLens ratings. content: fitted content model.
+
+    Returns:
+        Mean ranking metrics, rating errors, significance, the cold-start curve,
+        and a one-row frame of the selected hybrid_k and hybrid_beta.
+
+    Side effects:
+        Writes those tables and cold_start.png under the results directory.
+    """
     folds = per_user_folds(ratings)
     k_param, beta = tune_hybrid(movies, folds[0][0], content)
     ranking_frames = []
@@ -356,6 +478,14 @@ def run_evaluation(movies: pd.DataFrame, ratings: pd.DataFrame, content: Content
 
 
 def _plot_cold_start(frame: pd.DataFrame) -> None:
+    """Plot NDCG@10 against the number of known ratings, one line per model.
+
+    Args:
+        frame: Cold-start rows with known_ratings, model, and ndcg@10.
+
+    Side effects:
+        Writes results/cold_start.png and closes the figure.
+    """
     figure, axis = plt.subplots(figsize=(7, 5))
     for model, group in frame.groupby("model"):
         ordered = group.sort_values("known_ratings")

@@ -25,7 +25,19 @@ def community_table(
     prior_m: int = COMMUNITY_PRIOR_M,
     min_tmdb_votes: int = COMMUNITY_MIN_TMDB_VOTES,
 ) -> pd.DataFrame:
-    """Return one row per MovieLens ``movieId`` with the display score and both sources."""
+    """Return one row per MovieLens ``movieId`` with the display score and both sources.
+
+    Args:
+        tmdb: TMDB movies with id, vote_average, and vote_count.
+        links: MovieLens links with movieId and tmdbId. Null tmdbId rows are dropped.
+        ratings: MovieLens ratings with movieId and rating.
+        prior_m: Pseudo-count in the Bayesian shrink. Default is 50.
+        min_tmdb_votes: TMDB vote count required before TMDB is the primary source.
+
+    Returns:
+        Columns movieId, avg_rating, rating_count, rating_source, rating_scale,
+        and the raw TMDB and MovieLens averages and counts. Missing scores are None.
+    """
     tmdb_scores = _tmdb_scores(tmdb)
     lens_scores = _movielens_scores(ratings)
     joined = links.dropna(subset=["tmdbId"])[["movieId", "tmdbId"]].drop_duplicates("movieId").copy()
@@ -42,6 +54,14 @@ def community_table(
     table = pd.DataFrame(rows).astype(object)
 
     def _blank(value):
+        """Turn a pandas missing value into None and leave other values unchanged.
+
+        Args:
+            value: One cell from the community table.
+
+        Returns:
+            None when the cell is NA, otherwise the original value.
+        """
         try:
             missing = bool(pd.isna(value))
         except (TypeError, ValueError):
@@ -52,6 +72,15 @@ def community_table(
 
 
 def _tmdb_scores(tmdb: pd.DataFrame) -> pd.DataFrame:
+    """Copy TMDB vote columns and blank averages that have no votes.
+
+    Args:
+        tmdb: TMDB movies with id, vote_average, and vote_count.
+
+    Returns:
+        Columns id, tmdb_vote_average, and tmdb_vote_count. A zero vote count
+        stores a null average.
+    """
     frame = tmdb[["id", "vote_average", "vote_count"]].copy()
     frame["id"] = frame["id"].astype(int)
     frame["tmdb_vote_count"] = frame["vote_count"].fillna(0).astype(int)
@@ -60,6 +89,15 @@ def _tmdb_scores(tmdb: pd.DataFrame) -> pd.DataFrame:
 
 
 def _movielens_scores(ratings: pd.DataFrame) -> pd.DataFrame:
+    """Average MovieLens stars per movie and double them onto the 0–10 scale.
+
+    Args:
+        ratings: Rows with movieId and rating.
+
+    Returns:
+        Columns movieId, movielens_average, and movielens_count. An empty
+        ratings frame returns those columns with no rows.
+    """
     if ratings.empty:
         return pd.DataFrame(columns=["movieId", "movielens_average", "movielens_count"])
     grouped = ratings.groupby("movieId")["rating"].agg(["mean", "count"]).reset_index()
@@ -70,6 +108,14 @@ def _movielens_scores(ratings: pd.DataFrame) -> pd.DataFrame:
 
 
 def _global_mean(values: pd.Series) -> float | None:
+    """Return the mean of the non-null values.
+
+    Args:
+        values: One source's per-movie averages.
+
+    Returns:
+        The mean, or None when every value is null.
+    """
     clean = values.dropna()
     if clean.empty:
         return None
@@ -77,6 +123,19 @@ def _global_mean(values: pd.Series) -> float | None:
 
 
 def _choose(row, tmdb_mean: float | None, lens_mean: float | None, prior_m: int, min_tmdb_votes: int) -> dict:
+    """Pick TMDB or MovieLens and shrink that average toward its global mean.
+
+    TMDB wins at min_tmdb_votes. Else MovieLens if it has ratings, else a smaller TMDB count.
+
+    Args:
+        row: Joined movie with both source averages and counts.
+        tmdb_mean: Global TMDB vote_average, or None. lens_mean: doubled MovieLens mean, or None.
+        prior_m: Pseudo-count of the chosen center. min_tmdb_votes: votes for primary TMDB.
+
+    Returns:
+        Score rounded to one decimal, source name, and both raw sources. avg_rating
+        is None when no source or no center is available.
+    """
     tmdb_count = int(row.tmdb_vote_count) if pd.notna(row.tmdb_vote_count) and int(row.tmdb_vote_count) > 0 else None
     tmdb_average = float(row.tmdb_vote_average) if tmdb_count and pd.notna(row.tmdb_vote_average) else None
     lens_count = int(row.movielens_count) if pd.notna(getattr(row, "movielens_count", None)) and int(row.movielens_count) > 0 else None

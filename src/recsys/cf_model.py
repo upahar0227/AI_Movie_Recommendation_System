@@ -33,13 +33,32 @@ class CollaborativeModels:
     popularity: np.ndarray
 
     def item_index(self, movie_id: int) -> int:
+        """Return the shared movie-index position of a catalog id.
+
+        Args:
+            movie_id: MovieLens id.
+
+        Returns:
+            Column position in the training matrix and factor arrays.
+
+        Raises:
+            KeyError: The id is not in the fitted catalog.
+        """
         try:
             return self.id_to_idx[int(movie_id)]
         except KeyError as exc:
             raise KeyError(f"Unknown movie id {movie_id}") from exc
 
     def user_vector(self, ratings: list[tuple[int, float]]) -> np.ndarray:
-        """Dense rating vector in movie-index order. Unrated movies stay 0."""
+        """Build a dense rating vector in movie-index order. Unrated movies stay 0.
+
+        Args:
+            ratings: (movie id, star rating) pairs. Unknown ids are ignored.
+                A repeated id keeps the last rating.
+
+        Returns:
+            Array of shape (n_movies,) with zeros where the user has no rating.
+        """
         vector = np.zeros(len(self.movie_ids), dtype=np.float64)
         for movie_id, rating in ratings:
             index = self.id_to_idx.get(int(movie_id))
@@ -48,7 +67,16 @@ class CollaborativeModels:
         return vector
 
     def knn_scores(self, ratings: list[tuple[int, float]]) -> np.ndarray:
-        """Predicted rating for every movie from the user's top-k item neighbors."""
+        """Predict a rating for every movie from the user's top-k item neighbors.
+
+        Neighbors the user has not rated are dropped from that movie's average.
+
+        Args:
+            ratings: (movie id, star rating) pairs.
+
+        Returns:
+            Array of shape (n_movies,). Movies with no rated neighbor stay 0.
+        """
         observed = self.user_vector(ratings)
         gathered = observed[self.neighbor_index]
         weights = self.neighbor_similarity * (gathered > 0)
@@ -58,7 +86,15 @@ class CollaborativeModels:
         return scores
 
     def svd_scores(self, ratings: list[tuple[int, float]]) -> np.ndarray:
-        """Fold the user into the fitted SVD and reconstruct a rating for every movie."""
+        """Fold the user into the fitted SVD and reconstruct a rating for every movie.
+
+        Args:
+            ratings: (movie id, star rating) pairs. An all-zero vector returns zeros
+                instead of a reconstruction.
+
+        Returns:
+            Array of shape (n_movies,), clipped to the 0.5–5 star range.
+        """
         observed = self.user_vector(ratings)
         if not np.any(observed):
             return np.zeros(len(self.movie_ids), dtype=np.float64)
@@ -68,15 +104,41 @@ class CollaborativeModels:
         return np.clip(predicted, 0.5, 5.0)
 
     def popularity_scores(self) -> np.ndarray:
-        """Ranking score: log of the training rating count."""
+        """Return the log of one plus each movie's training rating count.
+
+        Returns:
+            Array of shape (n_movies,).
+        """
         return np.log1p(self.popularity)
 
 
 def _index_maps(ids: np.ndarray) -> dict[int, int]:
+    """Map each id to its position in the array.
+
+    Args:
+        ids: User or movie ids in the order used by the training matrix.
+
+    Returns:
+        id to row or column index. Duplicate ids keep the last position.
+    """
     return {int(value): index for index, value in enumerate(ids)}
 
 
 def _top_neighbors(similarity: np.ndarray, neighbors: int) -> tuple[np.ndarray, np.ndarray]:
+    """Keep each item's strongest non-negative neighbors.
+
+    Args:
+        similarity: Square item-item cosine matrix. The diagonal and negatives
+            are zeroed in place.
+        neighbors: Neighbors to keep per item, capped at one less than the width.
+
+    Returns:
+        Neighbor indexes of shape (n_items, k) and their similarities, both
+        sorted from strongest to weakest in each row.
+
+    Side effects:
+        Writes zeros into the diagonal and negative entries of similarity.
+    """
     np.fill_diagonal(similarity, 0.0)
     similarity[similarity < 0] = 0.0
     width = similarity.shape[0]
@@ -89,7 +151,19 @@ def _top_neighbors(similarity: np.ndarray, neighbors: int) -> tuple[np.ndarray, 
 
 
 def fit_collaborative(movies: pd.DataFrame, ratings: pd.DataFrame) -> CollaborativeModels:
-    """Fit item-kNN and SVD on the training ratings only."""
+    """Fit item-kNN and SVD on the training ratings only.
+
+    Args:
+        movies: Catalog order. ``movieId`` defines the shared item index.
+        ratings: Training rows with userId, movieId, and rating. Ratings whose
+            movie is outside the catalog are dropped.
+
+    Returns:
+        Fitted neighbor tables, SVD factors, item means, and rating counts.
+
+    Side effects:
+        Logs the user, item, and component counts.
+    """
     movie_ids = movies["movieId"].astype(int).to_numpy()
     id_to_idx = _index_maps(movie_ids)
     known = ratings.loc[ratings["movieId"].astype(int).isin(id_to_idx)].copy()

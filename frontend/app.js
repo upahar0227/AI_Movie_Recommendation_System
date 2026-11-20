@@ -64,6 +64,7 @@ function showGate() {
   refreshToken = "";
   onboardingCompleted = false;
   sessionStorage.removeItem("refresh_token");
+  closeSearch({ focus: false });
   setView("login");
 }
 
@@ -124,7 +125,12 @@ function setView(next) {
   nav.hidden = hideNav;
   nav.setAttribute("aria-hidden", hideNav ? "true" : "false");
   toggle.hidden = hideNav;
-  if (hideNav) closeMenu();
+  const searchButton = document.querySelector("#open-search");
+  if (searchButton) searchButton.hidden = hideNav;
+  if (hideNav) {
+    closeMenu();
+    closeSearch({ focus: false });
+  }
   document.querySelector("#genre-step").classList.toggle("hidden", next !== "onboarding");
   if (next === "login") setPage("login");
   if (next === "onboarding") setPage("onboarding");
@@ -361,6 +367,14 @@ function sourceBreakdown(item) {
 function movieCard(item, options = {}) {
   const row = document.createElement("article");
   row.className = "card";
+  row.dataset.movieId = String(item.movie_id);
+  if (options.fromSearch) {
+    row.addEventListener("click", (event) => {
+      if (event.target.closest("button, a, input")) return;
+      const typed = options.query;
+      logSearch(typed, item.movie_id).then(() => closeSearch()).catch((error) => toast(error.message));
+    });
+  }
   const text = document.createElement("div");
   text.className = "copy";
   const why = document.createElement("div");
@@ -370,7 +384,10 @@ function movieCard(item, options = {}) {
   more.type = "button";
   more.className = "ghost";
   more.textContent = "Similar";
-  more.addEventListener("click", () => showSimilar(item));
+  more.addEventListener("click", () => {
+    if (options.fromSearch) closeSearch({ focus: false });
+    showSimilar(item);
+  });
   text.append(titleLink(item), communityBadge(item), details(item), why, more);
   if (options.detail) text.append(sourceBreakdown(item));
   const save = document.createElement("button");
@@ -485,15 +502,87 @@ async function loadRecent() {
   for (const item of payload.ratings.slice(0, 4)) box.append(movieCard(item));
 }
 
+let searchLogTimer = 0;
+let searchRefreshTimer = 0;
+
+function normalQuery(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function searchOpen() {
+  const panel = document.querySelector("#search-panel");
+  return Boolean(panel && !panel.hidden);
+}
+
+function openSearch() {
+  const panel = document.querySelector("#search-panel");
+  const button = document.querySelector("#open-search");
+  if (!panel || !button || button.hidden) return;
+  panel.hidden = false;
+  button.setAttribute("aria-expanded", "true");
+  document.querySelector("#q").focus();
+}
+
+function closeSearch(options = {}) {
+  const panel = document.querySelector("#search-panel");
+  const button = document.querySelector("#open-search");
+  const input = document.querySelector("#q");
+  const heading = document.querySelector("#search-heading");
+  if (!panel || panel.hidden) return;
+  window.clearTimeout(searchLogTimer);
+  panel.hidden = true;
+  if (input) input.value = "";
+  if (heading) {
+    heading.textContent = "";
+    heading.hidden = true;
+  }
+  const hits = document.querySelector("#hits");
+  if (hits) hits.replaceChildren();
+  if (button) button.setAttribute("aria-expanded", "false");
+  if (options.focus !== false && button && !button.hidden) button.focus();
+}
+
 async function search(value) {
   const hits = document.querySelector("#hits");
+  const heading = document.querySelector("#search-heading");
   hits.replaceChildren();
-  if (value.trim().length < 1) return;
-  const payload = await api("/movies/search?q=" + encodeURIComponent(value));
+  const typed = value.trim();
+  if (typed.length < 1) {
+    heading.hidden = true;
+    heading.textContent = "";
+    return;
+  }
+  heading.hidden = false;
+  heading.textContent = "Results for " + typed;
+  const payload = await api("/movies/search?q=" + encodeURIComponent(typed));
   for (const item of payload.results) {
     if (item.user_rating !== undefined) knownRatings.set(item.movie_id, item.user_rating);
-    hits.append(movieCard(item));
+    hits.append(movieCard(item, { fromSearch: true, query: typed }));
   }
+}
+
+function scheduleSearchLog(value) {
+  window.clearTimeout(searchLogTimer);
+  if (!accessToken || normalQuery(value).length < 2) return;
+  searchLogTimer = window.setTimeout(() => logSearch(value), 1500);
+}
+
+async function logSearch(value, clickedMovieId) {
+  if (!accessToken || normalQuery(value).length < 2) return;
+  const hits = [...document.querySelectorAll("#hits article")];
+  const matched = clickedMovieId ? [] : hits.map((row) => Number(row.dataset.movieId)).filter((id) => id);
+  const body = { query: value, matched_movie_ids: matched.slice(0, 10) };
+  if (clickedMovieId) body.clicked_movie_id = clickedMovieId;
+  await api("/search/events", { method: "POST", body: JSON.stringify(body) });
+  if (clickedMovieId) scheduleHomeRefresh();
+}
+
+function scheduleHomeRefresh() {
+  window.clearTimeout(searchRefreshTimer);
+  searchRefreshTimer = window.setTimeout(() => {
+    if (appView !== "main" || searchOpen()) return;
+    loadRecommendations({ stay: true }).then(() => toast("Recommendations updated.")).catch((error) => toast(error.message));
+  }, 500);
 }
 
 async function showList(kind) {
@@ -600,8 +689,46 @@ document.querySelector("#auth-form").addEventListener("submit", async (event) =>
   }
 });
 
-document.querySelector("#find").addEventListener("click", () => search(document.querySelector("#q").value));
-document.querySelector("#q").addEventListener("input", (event) => search(event.target.value));
+document.querySelector("#open-search").addEventListener("click", () => {
+  if (searchOpen()) closeSearch();
+  else openSearch();
+});
+document.addEventListener("click", (event) => {
+  const panel = document.querySelector("#search-panel");
+  const button = document.querySelector("#open-search");
+  if (!searchOpen()) return;
+  if (panel.contains(event.target) || button.contains(event.target)) return;
+  closeSearch();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && searchOpen()) {
+    event.preventDefault();
+    closeSearch();
+    return;
+  }
+  if (event.key !== "/" || searchOpen()) return;
+  const tag = document.activeElement && document.activeElement.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  event.preventDefault();
+  openSearch();
+});
+document.querySelector("#q").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  const value = event.target.value;
+  window.clearTimeout(searchLogTimer);
+  search(value).then(() => logSearch(value)).catch((error) => toast(error.message));
+});
+document.querySelector("#q").addEventListener("input", (event) => {
+  search(event.target.value);
+  scheduleSearchLog(event.target.value);
+});
+document.querySelector("#clear-searches").addEventListener("click", async () => {
+  closeSearch({ focus: false });
+  await api("/users/me/searches", { method: "DELETE" });
+  await loadRecommendations({ stay: true });
+  toast("Recommendations updated.");
+});
 document.querySelector("#save-genres").addEventListener("click", async () => {
   const error = document.querySelector("#genre-error");
   error.textContent = "";
@@ -623,6 +750,7 @@ async function followHash() {
     setPage("login");
     return;
   }
+  closeSearch({ focus: false });
   const next = canonicalHash(location.hash);
   if (location.hash !== next) history.replaceState(null, "", next);
   closeMenu();

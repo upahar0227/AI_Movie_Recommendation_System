@@ -47,9 +47,24 @@ SIGNAL_RATING_MID = 0.2
 SIGNAL_WATCHLIST = 0.6
 SIGNAL_CLICK = 0.3
 SIGNAL_SEARCH = 0.1
-# Recent activity can never outweigh the long-term profile.
-W_RECENT_MAX = 0.40
-W_RECENT_K = 5
+# Recent activity and searches share the list with the long-term profile.
+# Caps keep the original profile at 45% or more: 1 - 0.30 - 0.25.
+R_MAX = 0.30
+K_R = 5
+W_RECENT_MAX = R_MAX
+W_RECENT_K = K_R
+S_MAX = 0.25
+K_S = 3
+SEARCH_QUERY_STRENGTH = 0.3
+SEARCH_CLICK_STRENGTH = 0.8
+SEARCH_HALF_LIFE_DAYS = 3
+SEARCH_WINDOW_DAYS = 14
+SEARCH_EVENT_LIMIT = 10
+SEARCH_DEDUP_MINUTES = 10
+SEARCH_MIN_CHARS = 2
+SEARCH_MIN_SLOTS = 2
+SEARCH_SLOT_HOURS = 24
+SEARCH_TITLE_MATCH = 0.86
 BASE_HALF_LIFE_DAYS = 365
 RECENT_HALF_LIFE_DAYS = 7
 BASE_GENRE_WEIGHT = 0.35

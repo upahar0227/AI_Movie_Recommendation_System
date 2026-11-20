@@ -110,13 +110,21 @@ py -3 -m alembic upgrade head
 py -3 -m uvicorn api.main:app --port 8000
 ```
 
-Open http://127.0.0.1:8000 and create an account. The page keeps the access token in memory only. A new account picks genres first. With no ratings, `GET /recommendations/me` returns the highest-rated films in those genres (`mode` is `genre`). After the first rating the hybrid model is used. Under five ratings the mode is `warming_up`. At five or more it is `personalised`. The blend weight is `n / (n + k)`.
+Open http://127.0.0.1:8000 and create an account. The page keeps the access token in memory only. A new account picks genres first. With no ratings, `GET /recommendations/me` returns the highest-rated films in those genres (`mode` is `genre`). After the first rating the hybrid model is used. Under five ratings the mode is `warming_up`. At five or more it is `personalised`.
 
-Ratings of 4 and above pull the content profile toward that film. Ratings of 2 and below push away from its genres, cast, and keywords. `CONTENT_DISLIKE_WEIGHT` in `src/recsys/config.py` is `0.5`: the content score subtracts `0.5` times the similarity to those disliked films. Clicks are not stored as ratings. `CLICK_SIGNAL_WEIGHT` is `0.15`, so a click adds only a small fraction of that film's text vector. Search text is stored on an interaction row with `event_type` `search` and is not used as a rating.
+Home mixes three scores, each scaled to 0–1:
+
+`final = w_base * base + w_recent * recent + w_search * search`
+
+`base` is the long-term profile: chosen genres plus ratings, using hybrid SVD and content. `recent` is ratings, watchlist adds, and clicks from the last 14 days. `search` is the last 10 distinct submitted searches from the last 14 days. A missing signal has weight 0 and the other weights are rescaled so they still sum to 1.
+
+`w_recent = min(R_MAX, n_recent / (n_recent + K_R))` with `R_MAX = 0.30` and `K_R = 5`. `w_search = min(S_MAX, n_search / (n_search + K_S))` with `S_MAX = 0.25` and `K_S = 3`. `w_base = 1 - w_recent - w_search`, so the original profile stays at least 0.45. A query adds `SEARCH_QUERY_STRENGTH = 0.3`, split across the top matched movies. A click on a result adds `SEARCH_CLICK_STRENGTH = 0.8` for that movie. Search half-life is `SEARCH_HALF_LIFE_DAYS = 3`. A search in the last 24 hours reserves `SEARCH_MIN_SLOTS = 2` of the top 10 for related movies. All of these live in `src/recsys/config.py`.
+
+Ratings of 4 and above pull the content profile toward that film. Ratings of 2 and below push away from its genres, cast, and keywords. `CONTENT_DISLIKE_WEIGHT` in `src/recsys/config.py` is `0.5`. Clicks are not stored as ratings. `CLICK_SIGNAL_WEIGHT` is `0.15`. A submitted search is stored only in `search_events`: the query text, the normalised query, up to 10 matched movie ids, and the clicked movie id. Typing is not stored, and a search is never saved as a rating. The same normalised query inside 10 minutes updates that row instead of adding another. Recommendation responses do not include the query. Cards say "Based on your recent activity", or "Similar to {title}" when a result was clicked. Clear search history in the account menu, or call `DELETE /users/me/searches`, to delete those rows and rebuild the list.
 
 ## Privacy
 
-The app stores an email, a username, a bcrypt password hash, movie ratings, a watchlist, and events (impression, click, rating, watchlist add, and the text of a search). It does not use third-party analytics. MovieLens files stay read-only. Delete the account from the page, or call `DELETE /users/me` while signed in, to remove the user and every related row.
+The app stores an email, a username, a bcrypt password hash, movie ratings, a watchlist, interaction events (impression, click, rating, watchlist add), and submitted searches. A search row stores the query text, the matched movie ids, and the result that was clicked. It does not use third-party analytics. MovieLens files stay read-only. Delete one search or clear Search history on Home to drop that influence. Delete the account from the page, or call `DELETE /users/me` while signed in, to remove the user and every related row.
 
 ## API
 
@@ -128,6 +136,7 @@ The app stores an email, a username, a bcrypt password hash, movie ratings, a wa
 - `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`
 - `GET /users/me`, `DELETE /users/me`
 - `POST /ratings`, `GET /ratings/me`, `POST /watchlist/{movie_id}`, `GET /recommendations/me`
+- `POST /search/events`, `GET /users/me/searches`, `DELETE /users/me/searches/{id}`, `DELETE /users/me/searches`
 
 Unknown movies and users return 404. Ratings outside 0.5–5 return 422.
 
