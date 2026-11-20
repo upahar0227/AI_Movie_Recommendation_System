@@ -18,12 +18,24 @@ class ContentModel:
     """Cosine similarity over a TF-IDF matrix with at most 5000 features."""
 
     def __init__(self) -> None:
+        """Create an unfitted TF-IDF vectorizer capped at the configured feature count."""
         self.vectorizer = TfidfVectorizer(max_features=TFIDF_MAX_FEATURES)
         self.matrix = None
         self.movie_ids: np.ndarray | None = None
         self.id_to_idx: dict[int, int] = {}
 
     def fit(self, movies: pd.DataFrame) -> ContentModel:
+        """Fit TF-IDF on the ``tags`` column and keep the movie-id index.
+
+        Args:
+            movies: Frame with ``movieId`` and ``tags``. Empty tags become "".
+
+        Returns:
+            This model. ``matrix`` has shape (n_movies, n_features).
+
+        Side effects:
+            Logs the fitted movie and feature counts.
+        """
         self.movie_ids = movies["movieId"].astype(int).to_numpy()
         self.id_to_idx = {int(movie_id): index for index, movie_id in enumerate(self.movie_ids)}
         self.matrix = self.vectorizer.fit_transform(movies["tags"].fillna(""))
@@ -35,19 +47,47 @@ class ContentModel:
         return self
 
     def similar_scores(self, movie_id: int) -> np.ndarray:
-        """Cosine similarity of one movie against every movie. Shape ``(n_movies,)``."""
+        """Return cosine similarity of one movie against every movie.
+
+        Args:
+            movie_id: Catalog id that must already be in the fitted index.
+
+        Returns:
+            Array of shape (n_movies,), including similarity to itself.
+
+        Raises:
+            KeyError: movie_id was not in the fitted catalog.
+        """
         vector = self.matrix[self._index(movie_id)]
         return cosine_similarity(vector, self.matrix).ravel()
 
     def recommend_similar(self, movie_id: int, n: int = 10) -> list[tuple[int, float]]:
-        """Return ``n`` movies most similar to ``movie_id``, excluding itself."""
+        """Return ``n`` movies most similar to ``movie_id``, excluding itself.
+
+        Args:
+            movie_id: Query movie. Its own score is set below zero so it cannot rank.
+            n: Maximum neighbours to return.
+
+        Returns:
+            (movie id, cosine) pairs, highest cosine first. Negative scores are dropped.
+
+        Raises:
+            KeyError: movie_id was not in the fitted catalog.
+        """
         scores = self.similar_scores(movie_id)
         scores = scores.copy()
         scores[self._index(movie_id)] = -1.0
         return self._top(scores, n, exclude=set())
 
     def profile_vector(self, ratings: list[tuple[int, float]]) -> np.ndarray | None:
-        """Average TF-IDF vector of movies rated at least 4, else of any rated movie."""
+        """Average the TF-IDF rows of movies rated at least 4, else of any rated movie.
+
+        Args:
+            ratings: (movie id, star rating) pairs. Unknown ids are ignored.
+
+        Returns:
+            A dense row of shape (1, n_features), or None when no rated id is in the catalog.
+        """
         liked = [movie_id for movie_id, rating in ratings if rating >= MIN_RATING_LIKED and movie_id in self.id_to_idx]
         chosen = liked or [movie_id for movie_id, _rating in ratings if movie_id in self.id_to_idx]
         if not chosen:
@@ -56,7 +96,15 @@ class ContentModel:
         return np.asarray(self.matrix[indexes].mean(axis=0))
 
     def recommend_for_user(self, ratings: list[tuple[int, float]], n: int = 10) -> list[tuple[int, float]]:
-        """Rank the catalog by cosine similarity to the user's liked-movie profile."""
+        """Rank the catalog by cosine similarity to the user's liked-movie profile.
+
+        Args:
+            ratings: (movie id, star rating) pairs. Every rated id is excluded.
+            n: Maximum recommendations.
+
+        Returns:
+            (movie id, cosine) pairs. Empty when the profile has no known movies.
+        """
         profile = self.profile_vector(ratings)
         if profile is None:
             return []
@@ -75,6 +123,15 @@ class ContentModel:
 
         ``click_weight`` and ``dislike_weight`` default to 0, which is the evaluation path:
         the average of movies rated at least 4. Serving passes the weights from config.
+
+        Args:
+            ratings: (movie id, star rating) pairs. Ratings of 2 or below form the penalty.
+            clicks: Movie ids whose mean vector is added when click_weight is non-zero.
+            click_weight: Scale of the click vector. 0 leaves clicks unused.
+            dislike_weight: Scale subtracted for the mean of movies rated 2 or below.
+
+        Returns:
+            Cosine scores of shape (n_movies,). Zeros when no profile and no clicks exist.
         """
         profile = self.profile_vector(ratings)
         width = 0 if self.movie_ids is None else len(self.movie_ids)
@@ -97,12 +154,33 @@ class ContentModel:
         return scores
 
     def _index(self, movie_id: int) -> int:
+        """Return the fitted row index of a catalog id.
+
+        Args:
+            movie_id: MovieLens id.
+
+        Returns:
+            Row position in ``matrix`` and ``movie_ids``.
+
+        Raises:
+            KeyError: The id is not in the fitted catalog.
+        """
         try:
             return self.id_to_idx[int(movie_id)]
         except KeyError as exc:
             raise KeyError(f"Unknown movie id {movie_id}") from exc
 
     def _top(self, scores: np.ndarray, n: int, exclude: set[int]) -> list[tuple[int, float]]:
+        """Return the highest non-negative scores, skipping excluded ids.
+
+        Args:
+            scores: One score per fitted movie.
+            n: Maximum pairs to return.
+            exclude: Movie ids to skip.
+
+        Returns:
+            (movie id, score) pairs in descending score order.
+        """
         order = np.argsort(-scores)
         picked: list[tuple[int, float]] = []
         for index in order:
@@ -116,6 +194,14 @@ class ContentModel:
 
 
 def fit_content(movies: pd.DataFrame) -> ContentModel:
-    """Fit the content model. ``SEED`` is recorded so every run stays aligned with other models."""
+    """Fit and return a content model on the ``tags`` column.
+
+    Args:
+        movies: Frame passed to ContentModel.fit.
+
+    Returns:
+        The fitted model. The shared ``SEED`` constant is referenced so this
+        entry point stays tied to the other models' seed.
+    """
     _ = SEED
     return ContentModel().fit(movies)

@@ -30,7 +30,12 @@ class RawPaths:
     imdb_reviews: Path
 
     def missing(self) -> list[Path]:
-        """Return files that must exist before a real merge can run."""
+        """Return files that must exist before a real merge can run.
+
+        Returns:
+            Missing MovieLens, TMDB, and IMDb paths. An undiscovered MovieLens
+            directory is reported as the three csv names under raw_dir.
+        """
         missing: list[Path] = []
         if self.movielens_dir is None:
             for name in ("ratings.csv", "movies.csv", "links.csv"):
@@ -55,15 +60,25 @@ class Catalog:
 
     @property
     def n_movies(self) -> int:
+        """Return the number of distinct MovieLens ids in the joined catalog."""
         return int(self.movies["movieId"].nunique())
 
     @property
     def n_ratings(self) -> int:
+        """Return the number of rating rows kept after the catalog join."""
         return int(len(self.ratings))
 
 
 def resolve_raw_paths(raw_dir: Path = RAW_DIR) -> RawPaths:
-    """Find MovieLens either in ``raw_dir`` or in ``raw_dir/ml-latest-small``."""
+    """Find MovieLens either in ``raw_dir`` or in ``raw_dir/ml-latest-small``.
+
+    Args:
+        raw_dir: Directory that holds the TMDB and IMDb files and maybe MovieLens.
+
+    Returns:
+        Paths for the three sources. movielens_dir is None when the three
+        MovieLens csv files are in neither location.
+    """
     movielens_dir = None
     for candidate in (raw_dir, raw_dir / "ml-latest-small"):
         if all((candidate / name).is_file() for name in ("ratings.csv", "movies.csv", "links.csv")):
@@ -83,6 +98,16 @@ def load_catalog(paths: RawPaths | None = None) -> Catalog:
 
     IMDb reviews are loaded for the sentiment model only. They are not joined to movies,
     because that file has no movie identifier.
+
+    Args:
+        paths: Dataset locations. None resolves them from the default raw directory.
+
+    Returns:
+        Movies inner-joined on tmdbId, ratings of those movies, full TMDB credits,
+        and the IMDb review frame.
+
+    Raises:
+        FileNotFoundError: A required csv is missing. The message lists those paths.
     """
     paths = paths or resolve_raw_paths()
     missing = paths.missing()
@@ -128,7 +153,18 @@ def merge_movielens_tmdb(
     tmdb_movies: pd.DataFrame,
     credits: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Inner-join MovieLens movies to TMDB through ``links.tmdbId``."""
+    """Inner-join MovieLens movies to TMDB through ``links.tmdbId``.
+
+    Args:
+        ml_movies: MovieLens movies.csv.
+        links: MovieLens links.csv. Rows with a null tmdbId are dropped.
+        tmdb_movies: TMDB movies file, joined on its ``id`` column.
+        credits: TMDB credits. Cast and crew are attached by movie_id; missing
+            credit rows become the JSON list ``[]``.
+
+    Returns:
+        One row per movieId. Duplicate movieId values keep the first row.
+    """
     link_rows = links.dropna(subset=["tmdbId"]).copy()
     link_rows["tmdbId"] = link_rows["tmdbId"].astype(int)
     linked = ml_movies.merge(link_rows[["movieId", "imdbId", "tmdbId"]], on="movieId", how="inner")
@@ -152,12 +188,30 @@ def merge_movielens_tmdb(
 
 
 def _require_columns(frame: pd.DataFrame, columns: tuple[str, ...], path: Path) -> None:
+    """Require named columns before the frame is used.
+
+    Args:
+        frame: Loaded csv.
+        columns: Names that must all be present.
+        path: File path included in the error so the missing source is obvious.
+
+    Raises:
+        ValueError: One or more names are absent.
+    """
     missing = [name for name in columns if name not in frame.columns]
     if missing:
         raise ValueError(f"{path} is missing columns: {', '.join(missing)}")
 
 
 def main() -> int:
+    """Load the catalog and log its size.
+
+    Returns:
+        0 when the catalog loads, 1 when a source file is missing.
+
+    Side effects:
+        Configures the root logger and writes catalog counts to the log.
+    """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     try:
         catalog = load_catalog()

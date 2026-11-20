@@ -9,7 +9,20 @@ from .config import N_FOLDS, SEED
 
 
 def per_user_folds(ratings: pd.DataFrame, n_folds: int = N_FOLDS, seed: int = SEED) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
-    """Split each user's ratings into ``n_folds`` disjoint test folds."""
+    """Split each user's ratings into ``n_folds`` disjoint test folds.
+
+    A movie a user rated lands in only one test fold. Other users' rows for that
+    movie can still sit in train.
+
+    Args:
+        ratings: Rows with userId, movieId, and rating.
+        n_folds: Folds per user. Each rating is assigned position modulo this count.
+        seed: Shuffle seed, applied independently inside each user group.
+
+    Returns:
+        ``n_folds`` pairs of (train, test) frames. Test rows of one fold are dropped
+        from that fold's train.
+    """
     rng = np.random.default_rng(seed)
     assignments: list[pd.Series] = []
     for _user_id, group in ratings.groupby("userId"):

@@ -33,42 +33,85 @@ router = APIRouter(tags=["library"])
 
 
 class RatingBody(BaseModel):
+    """A MovieLens movie id and a half-star rating."""
+
     movie_id: int
     rating: float
 
     @field_validator("rating")
     @classmethod
     def half_star(cls, value: float) -> float:
+        """Accept only the ten half-star values from 0.5 to 5.0.
+
+        Args:
+            value: Submitted rating.
+
+        Returns:
+            The same rating.
+
+        Raises:
+            ValueError: The value is not one of those steps. FastAPI reports this as 422.
+        """
         if value not in RATING_VALUES:
             raise ValueError("Rating must be from 0.5 to 5.0 in steps of 0.5.")
         return value
 
 
 class GenreBody(BaseModel):
+    """At least one genre name chosen during onboarding."""
+
     genres: list[str] = Field(min_length=1)
 
 
 class GenreUpdateBody(BaseModel):
+    """Replacement genre list, limited to the configured maximum."""
+
     genres: list[str] = Field(min_length=1, max_length=GENRE_SELECTION_MAX)
 
 
 class OnboardingBody(BaseModel):
+    """At least five half-star ratings collected before the main site opens."""
+
     ratings: list[RatingBody] = Field(min_length=5)
 
 
 class InteractionBody(BaseModel):
+    """A movie id and one of the stored interaction event types."""
+
     movie_id: int
     event_type: str
 
     @field_validator("event_type")
     @classmethod
     def known_event(cls, value: str) -> str:
+        """Accept only impression, click, rating, watchlist_add, or search.
+
+        Args:
+            value: Submitted event type.
+
+        Returns:
+            The same event type.
+
+        Raises:
+            ValueError: The type is not in that set. FastAPI reports this as 422.
+        """
         if value not in EVENT_TYPES:
             raise ValueError("Unknown event type.")
         return value
 
 
 def _service(request: Request) -> RecommenderService:
+    """Return the models loaded on the app.
+
+    Args:
+        request: Current request.
+
+    Returns:
+        The recommender service.
+
+    Raises:
+        HTTPException: 503 when the models are not loaded.
+    """
     service = getattr(request.app.state, "service", None)
     if service is None:
         raise HTTPException(status_code=503, detail="Models are not loaded. Train them first.")
@@ -76,12 +119,32 @@ def _service(request: Request) -> RecommenderService:
 
 
 def _require_movie(service: RecommenderService, movie_id: int) -> None:
+    """Reject a movie id that is not in the catalog.
+
+    Args:
+        service: Loaded movies.
+        movie_id: MovieLens id.
+
+    Raises:
+        HTTPException: 404 when the id is absent.
+    """
     catalog = {int(value) for value in service.movies["movieId"]}
     if int(movie_id) not in catalog:
         raise HTTPException(status_code=404, detail=f"Unknown movie id {movie_id}")
 
 
 def _save_rating(session: Session, user: User, movie_id: int, rating: float) -> None:
+    """Insert or update one rating and record a rating interaction.
+
+    Args:
+        session: Account session. The caller commits.
+        user: Signed-in account.
+        movie_id: MovieLens id.
+        rating: Half-star value already accepted by the body.
+
+    Side effects:
+        Writes the rating row and an interaction. A repeat updates the score and timestamp.
+    """
     now = datetime.now(timezone.utc)
     existing = session.scalar(select(Rating).where(Rating.user_id == user.id, Rating.movie_id == movie_id))
     if existing is None:
@@ -93,17 +156,45 @@ def _save_rating(session: Session, user: User, movie_id: int, rating: float) -> 
 
 
 def rating_map(session: Session, user_id: int) -> dict[int, float]:
+    """Load every rating the account has saved.
+
+    Args:
+        session: Account session.
+        user_id: Account id.
+
+    Returns:
+        MovieLens id to star rating.
+    """
     rows = session.scalars(select(Rating).where(Rating.user_id == user_id)).all()
     return {int(row.movie_id): float(row.rating) for row in rows}
 
 
 def apply_user_ratings(cards: list[dict], scores: dict[int, float]) -> list[dict]:
+    """Copy the account's rating onto each card.
+
+    Args:
+        cards: Dicts with ``movie_id``. They are changed in place.
+        scores: Movie id to star rating. A missing id stores None.
+
+    Returns:
+        The same list.
+    """
     for card in cards:
         card["user_rating"] = scores.get(int(card["movie_id"]))
     return cards
 
 
 def recent_clicks(session: Session, user_id: int, limit: int = 20) -> list[int]:
+    """Return recent clicked movie ids, newest first and without repeats.
+
+    Args:
+        session: Account session.
+        user_id: Account id.
+        limit: Maximum click rows to read before de-duplicating.
+
+    Returns:
+        Distinct MovieLens ids. A click with no movie id is skipped.
+    """
     rows = session.scalars(
         select(Interaction)
         .where(Interaction.user_id == user_id, Interaction.event_type == "click")
@@ -118,17 +209,42 @@ def recent_clicks(session: Session, user_id: int, limit: int = 20) -> list[int]:
 
 
 class SearchEventBody(BaseModel):
+    """A submitted search, its matched movie ids, and an optional clicked movie."""
+
     query: str = ""
     matched_movie_ids: list[int] = Field(default_factory=list)
     clicked_movie_id: int | None = None
 
 
 def _drop_recommendation_cache(session: Session, user_id: int) -> None:
+    """Delete the stored recommendation snapshot so the next list can change.
+
+    Args:
+        session: Account session. The caller commits.
+        user_id: Account id.
+
+    Side effects:
+        Deletes that account's recommendation-snapshot rows.
+    """
     session.execute(delete(RecommendationSnapshot).where(RecommendationSnapshot.user_id == user_id))
 
 
 @router.post("/ratings")
 def rate(body: RatingBody, request: Request, user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    """POST /ratings. Sign-in is required.
+
+    Body: movie id and a half-star rating from 0.5 to 5.0. A repeat replaces the old score.
+
+    Returns:
+        The saved movie id and rating.
+
+    Raises:
+        HTTPException: 401 when signed out, 404 when the movie is unknown, 422 when the
+        rating is not a half star, 503 when the models or database are missing.
+
+    Side effects:
+        Upserts the rating and adds a rating interaction. ``get_db`` commits.
+    """
     service = _service(request)
     _require_movie(service, body.movie_id)
     _save_rating(session, user, body.movie_id, body.rating)
@@ -137,12 +253,35 @@ def rate(body: RatingBody, request: Request, user: User = Depends(get_current_us
 
 @router.get("/genres")
 def list_genres(request: Request, user: User = Depends(get_current_user)):
+    """GET /genres. Sign-in is required.
+
+    Returns:
+        ``genres``: the sorted names present in the catalog.
+
+    Raises:
+        HTTPException: 401 when signed out, 503 when the models or database are missing.
+    """
     del user
     return {"genres": _service(request).catalog_genres()}
 
 
 @router.post("/genres")
 def save_genres(body: GenreBody, request: Request, user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    """POST /genres. Sign-in is required.
+
+    Body: at least one genre name. Blank and duplicate names are dropped. This also
+    marks onboarding complete.
+
+    Returns:
+        ``genres``: the names that were stored.
+
+    Raises:
+        HTTPException: 401 when signed out, 422 when a name is unknown or none remain,
+        503 when the models or database are missing.
+
+    Side effects:
+        Replaces the account's genres and clears its recommendation snapshot.
+    """
     catalog = set(_service(request).catalog_genres())
     chosen = []
     for genre in body.genres:
@@ -161,6 +300,14 @@ def save_genres(body: GenreBody, request: Request, user: User = Depends(get_curr
 
 @router.get("/users/me/genres")
 def my_genres(request: Request, user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    """GET /users/me/genres. Sign-in is required.
+
+    Returns:
+        The saved genres, every catalog genre, and the maximum number that can be selected.
+
+    Raises:
+        HTTPException: 401 when signed out, 503 when the models or database are missing.
+    """
     return {
         "genres": _saved_genres(session, user),
         "allowed": _service(request).catalog_genres(),
@@ -175,6 +322,20 @@ def update_genres(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_db),
 ):
+    """PUT /users/me/genres. Sign-in is required.
+
+    Body: 1 to the configured maximum genre names. Duplicates are dropped.
+
+    Returns:
+        ``genres``: the names that were stored.
+
+    Raises:
+        HTTPException: 401 when signed out, 422 when a name is unknown, none remain,
+        or the list is too long, 503 when the models or database are missing.
+
+    Side effects:
+        Replaces the account's genres and clears its recommendation snapshot.
+    """
     catalog = set(_service(request).catalog_genres())
     chosen = []
     for genre in body.genres:
@@ -194,6 +355,14 @@ def update_genres(
 
 @router.get("/ratings/me")
 def my_ratings(request: Request, user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    """GET /ratings/me. Sign-in is required.
+
+    Returns:
+        ``ratings``: movie cards, newest update first, each with ``rating`` and ``user_rating``.
+
+    Raises:
+        HTTPException: 401 when signed out, 503 when the models or database are missing.
+    """
     service = _service(request)
     rows = session.scalars(select(Rating).where(Rating.user_id == user.id).order_by(Rating.updated_at.desc())).all()
     payload = []
@@ -207,6 +376,21 @@ def my_ratings(request: Request, user: User = Depends(get_current_user), session
 
 @router.delete("/ratings/{movie_id}")
 def delete_rating(movie_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    """DELETE /ratings/{movie_id}. Sign-in is required.
+
+    Args:
+        movie_id: MovieLens id of the rating to remove.
+
+    Returns:
+        ``{"ok": true}``.
+
+    Raises:
+        HTTPException: 401 when signed out, 404 when this account has no such rating,
+        503 when the database is missing.
+
+    Side effects:
+        Deletes the rating and stores a rating interaction whose detail is ``delete``.
+    """
     row = session.scalar(select(Rating).where(Rating.user_id == user.id, Rating.movie_id == movie_id))
     if row is None:
         raise HTTPException(status_code=404, detail="No rating for that movie.")
@@ -225,6 +409,21 @@ def delete_rating(movie_id: int, user: User = Depends(get_current_user), session
 
 @router.post("/watchlist/{movie_id}")
 def add_watch(movie_id: int, request: Request, user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    """POST /watchlist/{movie_id}. Sign-in is required.
+
+    Args:
+        movie_id: MovieLens id to save.
+
+    Returns:
+        ``{"movie_id": movie_id}``.
+
+    Raises:
+        HTTPException: 401 when signed out, 404 when the movie is unknown, 409 when it
+        is already saved, 503 when the models or database are missing.
+
+    Side effects:
+        Inserts the watchlist row and a watchlist_add interaction.
+    """
     service = _service(request)
     _require_movie(service, movie_id)
     existing = session.scalar(
@@ -240,6 +439,21 @@ def add_watch(movie_id: int, request: Request, user: User = Depends(get_current_
 
 @router.delete("/watchlist/{movie_id}")
 def remove_watch(movie_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    """DELETE /watchlist/{movie_id}. Sign-in is required.
+
+    Args:
+        movie_id: MovieLens id to remove.
+
+    Returns:
+        ``{"ok": true}``.
+
+    Raises:
+        HTTPException: 401 when signed out, 404 when that movie is not on the watchlist,
+        503 when the database is missing.
+
+    Side effects:
+        Deletes the watchlist row. No interaction is written.
+    """
     row = session.scalar(select(WatchlistItem).where(WatchlistItem.user_id == user.id, WatchlistItem.movie_id == movie_id))
     if row is None:
         raise HTTPException(status_code=404, detail="That movie is not on your watchlist.")
@@ -249,6 +463,14 @@ def remove_watch(movie_id: int, user: User = Depends(get_current_user), session:
 
 @router.get("/watchlist/me")
 def my_watchlist(request: Request, user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    """GET /watchlist/me. Sign-in is required.
+
+    Returns:
+        ``watchlist``: movie cards, newest save first, each with ``user_rating``.
+
+    Raises:
+        HTTPException: 401 when signed out, 503 when the models or database are missing.
+    """
     service = _service(request)
     rows = session.scalars(
         select(WatchlistItem).where(WatchlistItem.user_id == user.id).order_by(WatchlistItem.created_at.desc())
@@ -259,6 +481,20 @@ def my_watchlist(request: Request, user: User = Depends(get_current_user), sessi
 
 @router.post("/onboarding")
 def onboard(body: OnboardingBody, request: Request, user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    """POST /onboarding. Sign-in is required.
+
+    Body: at least five half-star ratings. Each movie may appear only once.
+
+    Returns:
+        ``saved``: how many ratings were written.
+
+    Raises:
+        HTTPException: 401 when signed out, 404 when a movie is unknown, 422 when a
+        movie is repeated or a rating is invalid, 503 when the models or database are missing.
+
+    Side effects:
+        Upserts each rating, writes rating interactions, and marks onboarding complete.
+    """
     service = _service(request)
     seen: set[int] = set()
     for item in body.ratings:
@@ -279,6 +515,20 @@ def log_interaction(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_db),
 ):
+    """POST /interactions. Sign-in is required.
+
+    Body: movie id and an event type of impression, click, rating, watchlist_add, or search.
+
+    Returns:
+        ``{"ok": true}``.
+
+    Raises:
+        HTTPException: 401 when signed out, 404 when the movie is unknown, 422 when the
+        event type is unknown, 503 when the models or database are missing.
+
+    Side effects:
+        Inserts one interaction row.
+    """
     service = _service(request)
     _require_movie(service, body.movie_id)
     session.add(
@@ -299,6 +549,21 @@ def record_search(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_db),
 ):
+    """POST /search/events. Sign-in is required.
+
+    Body: query, the first 10 matched movie ids, and an optional clicked movie.
+    A normalised query under 2 characters is not stored. The same query within 10
+    minutes updates that row; a click updates the latest row for that query.
+
+    Returns:
+        ``logged`` false when too short; otherwise the row id and ``deduplicated``.
+
+    Raises:
+        HTTPException: 401 when signed out, 404 for an unknown clicked movie, 503 when unconfigured.
+
+    Side effects:
+        Inserts or updates a search row and deletes the recommendation snapshot.
+    """
     text = body.query.strip()[:200]
     normalised = normalize_query(text)
     if len(normalised) < SEARCH_MIN_CHARS:
@@ -339,6 +604,15 @@ def record_search(
 
 @router.get("/users/me/searches")
 def list_searches(user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    """GET /users/me/searches. Sign-in is required.
+
+    Returns:
+        ``searches``: id, query, normalised query, matched ids, clicked movie, and
+        created time, newest first. The recommendation route does not return the query.
+
+    Raises:
+        HTTPException: 401 when signed out, 503 when the database is missing.
+    """
     rows = session.scalars(
         select(SearchEvent).where(SearchEvent.user_id == user.id).order_by(SearchEvent.created_at.desc())
     ).all()
@@ -359,6 +633,21 @@ def list_searches(user: User = Depends(get_current_user), session: Session = Dep
 
 @router.delete("/users/me/searches/{search_id}")
 def delete_search(search_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    """DELETE /users/me/searches/{search_id}. Sign-in is required.
+
+    Args:
+        search_id: Search row owned by the signed-in account.
+
+    Returns:
+        ``deleted``: that id.
+
+    Raises:
+        HTTPException: 401 when signed out, 404 when the row is missing or belongs
+        to someone else, 503 when the database is missing.
+
+    Side effects:
+        Deletes the search and the recommendation snapshot.
+    """
     row = session.scalar(select(SearchEvent).where(SearchEvent.id == search_id, SearchEvent.user_id == user.id))
     if row is None:
         raise HTTPException(status_code=404, detail="Search not found.")
@@ -369,12 +658,31 @@ def delete_search(search_id: int, user: User = Depends(get_current_user), sessio
 
 @router.delete("/users/me/searches")
 def clear_searches(user: User = Depends(get_current_user), session: Session = Depends(get_db)):
+    """DELETE /users/me/searches. Sign-in is required.
+
+    Returns:
+        ``{"cleared": true}``.
+
+    Raises:
+        HTTPException: 401 when signed out, 503 when the database is missing.
+
+    Side effects:
+        Deletes every search for the account and its recommendation snapshot.
+    """
     session.execute(delete(SearchEvent).where(SearchEvent.user_id == user.id))
     _drop_recommendation_cache(session, user.id)
     return {"cleared": True}
 
 
 def _matched_ids(raw: str) -> list[int]:
+    """Parse a JSON list of movie ids stored on a search row.
+
+    Args:
+        raw: JSON text. Empty, invalid, or non-list text yields no ids.
+
+    Returns:
+        Integer movie ids in the stored order.
+    """
     try:
         parsed = json.loads(raw or "[]")
     except json.JSONDecodeError:
@@ -385,6 +693,14 @@ def _matched_ids(raw: str) -> list[int]:
 
 
 def _aware(value: datetime) -> datetime:
+    """Return a UTC datetime. A naive value is labeled UTC without shifting the clock.
+
+    Args:
+        value: A timestamp read from the database.
+
+    Returns:
+        An aware UTC datetime.
+    """
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
@@ -399,6 +715,21 @@ def my_recommendations(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_db),
 ):
+    """GET /recommendations/me. Sign-in is required.
+
+    Query: ``n`` from 1 to 50, default 10. Weight and debug fields apply only when
+    ``RECS_DEBUG`` is on. No ratings and no genres returns an empty ask-genres list.
+    The response never includes the search text.
+
+    Returns:
+        ``mode``, ``rating_count``, ``ratings_until_personalised``, and ``results``.
+
+    Raises:
+        HTTPException: 401 when signed out, 422 when ``n`` is out of range, 503 when unconfigured.
+
+    Side effects:
+        Replaces the snapshot and writes one impression per movie, except for ask-genres.
+    """
     service = _service(request)
     rows = session.scalars(select(Rating).where(Rating.user_id == user.id)).all()
     ratings = [RatedMovie(int(row.movie_id), float(row.rating), row.updated_at) for row in rows]
@@ -481,6 +812,16 @@ def my_recommendations(
 
 
 def _replace_genres(session: Session, user: User, chosen: list[str]) -> None:
+    """Replace the account's genres and drop the recommendation snapshot.
+
+    Args:
+        session: Account session. The caller commits.
+        user: Account whose ``favorite_genres`` JSON is also rewritten.
+        chosen: Genre names already checked against the catalog.
+
+    Side effects:
+        Deletes the old genre and snapshot rows, then inserts the new genres.
+    """
     session.execute(delete(UserGenre).where(UserGenre.user_id == user.id))
     session.execute(delete(RecommendationSnapshot).where(RecommendationSnapshot.user_id == user.id))
     session.flush()
@@ -491,6 +832,15 @@ def _replace_genres(session: Session, user: User, chosen: list[str]) -> None:
 
 
 def _saved_genres(session: Session, user: User) -> list[str]:
+    """Return the account's genres, using the genre table before the old JSON column.
+
+    Args:
+        session: Account session.
+        user: Account. A broken or non-list JSON value yields no names.
+
+    Returns:
+        Genre names. Table rows are ordered by time, then name.
+    """
     rows = session.scalars(select(UserGenre).where(UserGenre.user_id == user.id).order_by(UserGenre.created_at, UserGenre.genre)).all()
     if rows:
         return [row.genre for row in rows]
